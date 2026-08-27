@@ -696,6 +696,153 @@ async function attachSubtitle(archivePath, videoPath) {
   }
 }
 
+// --- Torrents ------------------------------------------------------------
+// A magnet link is not a page, so Chromium has nowhere to send it and the
+// click goes nowhere. Every route one can arrive by is caught instead and
+// handed to WebTorrent, which downloads into the same library folder the
+// gallery reads from and leaves the swarm the moment the download is complete.
+
+const TORRENT_TICK = 1000;
+
+let torrentClient = null;
+let torrentTimer = null;
+let torrentSeq = 0;
+
+const isMagnet = (value) => typeof value === 'string' && value.startsWith('magnet:');
+
+const sendAll = (channel, payload) => {
+  for (const win of BrowserWindow.getAllWindows()) win.webContents.send(channel, payload);
+};
+
+const torrentStatus = (text, failed) => sendAll('download-status', { text, failed });
+
+// WebTorrent ships as ESM while this file is CommonJS, so the client is pulled
+// in on first use: a session that never meets a magnet link never pays for it.
+async function getTorrentClient() {
+  if (!torrentClient) {
+    const { default: WebTorrent } = await import('webtorrent');
+    torrentClient = new WebTorrent();
+    torrentClient.on('error', (error) => torrentStatus(`Torrent error: ${error.message}`, true));
+  }
+  return torrentClient;
+}
+
+// What the bottom bar draws for one torrent. A magnet only names the swarm, so
+// the real name and size arrive once peers have handed over the metadata.
+const torrentView = (torrent) => ({
+  id: torrent.appId,
+  name: torrent.name || '',
+  progress: torrent.progress || 0,
+  downloaded: torrent.downloaded || 0,
+  length: torrent.length || 0,
+  speed: torrent.downloadSpeed || 0,
+  peers: torrent.numPeers || 0,
+  done: Boolean(torrent.done)
+});
+
+const listTorrents = () => (torrentClient ? torrentClient.torrents.map(torrentView) : []);
+
+// One ticker for the whole list, running only while something is in it.
+function startTorrentTicker() {
+  if (torrentTimer) return;
+  torrentTimer = setInterval(() => {
+    sendAll('torrent-progress', listTorrents());
+    if (!torrentClient || torrentClient.torrents.length === 0) {
+      clearInterval(torrentTimer);
+      torrentTimer = null;
+    }
+  }, TORRENT_TICK);
+}
+
+async function addMagnet(magnetURI) {
+  if (isBlocked()) return { ok: false, reason: 'blocked' };
+  if (!isMagnet(magnetURI)) return { ok: false, reason: 'not-a-magnet' };
+
+  if (!libraryPath) {
+    torrentStatus('Pick a library folder before downloading.', true);
+    return { ok: false, reason: 'no-library' };
+  }
+
+  let client;
+  try {
+    client = await getTorrentClient();
+  } catch (error) {
+    torrentStatus(`Could not start WebTorrent: ${error.message}`, true);
+    return { ok: false, reason: 'client-failed', message: error.message };
+  }
+
+  // Adding the same magnet twice tears the second copy down and reports that
+  // as an error, so a link clicked again is answered rather than added.
+  const running = await client.get(magnetURI).catch(() => null);
+  if (running) {
+    torrentStatus(`Already downloading ${running.name || 'that torrent'}.`);
+    return { ok: true, duplicate: true };
+  }
+
+  // The library folder is the whole point: WebTorrent lays the torrent out
+  // inside it exactly as the gallery expects to find videos.
+  const torrent = client.add(magnetURI, { path: libraryPath });
+  torrent.appId = `t${(torrentSeq += 1)}`;
+
+  torrent.on('error', (error) => torrentStatus(`Torrent failed: ${error.message}`, true));
+  torrent.on('metadata', () => torrentStatus(`Downloading ${torrent.name} to the library folder.`));
+  torrent.on('done', async () => {
+    // Nothing here seeds. Getting the files into the library is the whole job,
+    // so the swarm is left as soon as the last piece lands rather than being
+    // uploaded from in the background for as long as the app happens to be open.
+    const name = torrent.name || 'torrent';
+    await stopTorrent(torrent);
+
+    torrentStatus(`Finished ${name}. Saved to the library folder.`);
+    // The download is a folder the gallery has never listed, so it redraws.
+    sendAll('library-changed');
+    sendAll('torrent-progress', listTorrents());
+  });
+
+  torrentStatus('Looking for peers…');
+  startTorrentTicker();
+  sendAll('torrent-progress', listTorrents());
+  return { ok: true };
+}
+
+// Leaving the swarm: the connections go, everything already written to the
+// library stays. Finishing and pressing Stop both end up here, and a torrent
+// that finishes just as Stop is pressed reaches it twice, so a torrent the
+// client has already let go is not removed a second time.
+async function stopTorrent(torrent) {
+  if (!torrentClient || !torrentClient.torrents.includes(torrent)) return;
+  await new Promise((resolve) => torrentClient.remove(torrent, { destroyStore: false }, resolve));
+
+  // Dropping the last torrent leaves the client itself running a DHT node and
+  // a port open for incoming peers, which is the app still taking part in
+  // BitTorrent with nothing to show for it. With no downloads left there is
+  // nothing for any of that to serve, so the client goes too and the next
+  // magnet link builds a fresh one.
+  if (torrentClient.torrents.length === 0) {
+    const client = torrentClient;
+    torrentClient = null;
+    await new Promise((resolve) => client.destroy(resolve));
+  }
+}
+
+// Stop, for a torrent that has not finished: an abandoned download, with the
+// part of it that did arrive left in the library.
+async function removeTorrent(id) {
+  const torrent = torrentClient && torrentClient.torrents.find((item) => item.appId === id);
+  if (!torrent) return { ok: false, reason: 'not-found' };
+
+  const name = torrent.name || 'torrent';
+  await stopTorrent(torrent);
+
+  torrentStatus(`Stopped ${name}. What it had already downloaded stays in the library.`);
+  sendAll('torrent-progress', listTorrents());
+  return { ok: true };
+}
+
+ipcMain.handle('add-magnet', (event, magnetURI) => addMagnet(magnetURI));
+ipcMain.handle('remove-torrent', (event, id) => removeTorrent(id));
+ipcMain.handle('get-torrents', () => listTorrents());
+
 function createWindow() {
   const win = new BrowserWindow({
     width: 1280,
@@ -715,8 +862,18 @@ function createWindow() {
   // Every site is browsed in the window itself, sign-in flows on other domains
   // included; a link meant for a new tab simply takes the window with it.
   win.webContents.setWindowOpenHandler(({ url }) => {
-    win.loadURL(url);
+    if (isMagnet(url)) addMagnet(url);
+    else win.loadURL(url);
     return { action: 'deny' };
+  });
+
+  // Torrent sites reach a magnet either by a plain link or by setting the
+  // location from a script. Both land here as a navigation Chromium cannot
+  // carry out, so it is stopped and the link goes to WebTorrent instead.
+  win.webContents.on('will-navigate', (event, url) => {
+    if (!isMagnet(url)) return;
+    event.preventDefault();
+    addMagnet(url);
   });
 
   win.on('focus', () => win.webContents.send('library-progress-changed'));
@@ -1088,6 +1245,12 @@ app.whenReady().then(async () => {
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) createWindow();
   });
+});
+
+// Torrents keep seeding in the background, so the swarm is let go on the way out.
+app.on('before-quit', () => {
+  if (torrentClient) torrentClient.destroy();
+  torrentClient = null;
 });
 
 app.on('window-all-closed', () => {
