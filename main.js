@@ -31,6 +31,9 @@ const FFMPEG_CANDIDATES = ['/opt/homebrew/bin', '/usr/local/bin', '/usr/bin'];
 
 // Thumbnails: how deep to hunt for a folder's first video, and how many
 // ffmpeg runs may work at once.
+// Subtitle files VLC picks up when they sit beside a video under its name.
+const SUBTITLE_EXTENSIONS = ['.srt', '.ass', '.ssa', '.sub', '.vtt', '.smi', '.sbv'];
+
 const VIDEO_SEARCH_DEPTH = 5;
 const MAX_THUMBNAIL_JOBS = 2;
 
@@ -44,14 +47,6 @@ let missingDependencies = [];
 // Nothing this app does works without its outside tools, so every entry point
 // stays shut until they are all present.
 const isBlocked = () => missingDependencies.length > 0;
-
-const hostnameOf = (url) => {
-  try {
-    return new URL(url).hostname;
-  } catch {
-    return '';
-  }
-};
 
 const normalizeUrl = (value) => {
   try {
@@ -87,19 +82,6 @@ function saveSettings() {
   }
 }
 
-const isSameSite = (host, site) => {
-  const base = site.replace(/^www\./, '');
-  return Boolean(base) && (host === base || host.endsWith(`.${base}`));
-};
-
-// imdb.com and whatever sites the bottom-bar buttons point at stay in the app.
-const isInternal = (url) => {
-  const host = hostnameOf(url);
-  if (!host) return false;
-  if (isSameSite(host, 'imdb.com')) return true;
-  return Object.values(baseUrls).some((base) => isSameSite(host, hostnameOf(base)));
-};
-
 // The gallery may only ever reach inside the folder the user picked.
 function insideLibrary(target) {
   if (!libraryPath || typeof target !== 'string') return '';
@@ -110,11 +92,22 @@ function insideLibrary(target) {
 }
 
 // --- Resume positions ----------------------------------------------------
-// VLC records where playback stopped in its own preferences; that is what the
-// progress bar under each thumbnail reflects.
+// VLC records where playback stopped in its own preferences, but it drops a
+// video from that list the moment it plays to the end, and the list only holds
+// the last few dozen items. Either would blank a bar the user has earned, so
+// VLC is treated as a live feed and the app keeps its own durable copy.
 
 const VLC_DOMAIN = 'org.videolan.vlc';
 const POSITIONS_TTL = 2000;
+// A launched video VLC no longer remembers is only called finished once VLC
+// has quit, so a movie still playing does not read as watched.
+const WATCHED_LIMIT = 5000;
+const MAX_QUEUES = 20;
+// How much of a video must have run, with nothing kept by VLC, to call it done,
+// and the least time on screen that may count — a video resumed a minute from
+// the end still has to have been watched, not just opened.
+const FINISHED_RATIO = 0.85;
+const MIN_PLAYED = 30;
 
 const durationCache = new Map();
 const folderVideoCache = new Map();
@@ -151,7 +144,227 @@ async function readVlcPositions() {
 
   vlcPositions = positions;
   vlcPositionsReadAt = Date.now();
+  await absorbPositions(positions);
   return positions;
+}
+
+// --- Watched store -------------------------------------------------------
+// One record per video the app has seen played: where it stopped, or that it
+// ran to the end. Nothing here is ever cleared by VLC forgetting a file.
+
+let progressFile;
+let watched = new Map();
+// Playlists handed to VLC, so a video it has forgotten can be read as either
+// "finished, the queue moved past it" or "never reached".
+let queues = [];
+let saveTimer = null;
+
+function loadWatched() {
+  try {
+    const data = JSON.parse(fs.readFileSync(progressFile, 'utf8'));
+    watched = new Map(Object.entries(data.videos || {}));
+    queues = Array.isArray(data.queues) ? data.queues : [];
+  } catch {
+    watched = new Map();
+    queues = [];
+  }
+}
+
+function saveWatched() {
+  if (saveTimer) return;
+  saveTimer = setTimeout(async () => {
+    saveTimer = null;
+    const data = { videos: Object.fromEntries(watched), queues };
+    await fsp.writeFile(progressFile, JSON.stringify(data)).catch(() => {});
+  }, 500);
+  saveTimer.unref();
+}
+
+function remember(target, record) {
+  watched.delete(target);
+  watched.set(target, record);
+  // Map order is insertion order, so the stalest records fall off the front.
+  while (watched.size > WATCHED_LIMIT) watched.delete(watched.keys().next().value);
+}
+
+async function isVlcRunning() {
+  try {
+    const { stdout } = await execFileAsync('pgrep', ['-x', process.platform === 'darwin' ? 'VLC' : 'vlc']);
+    return stdout.trim().length > 0;
+  } catch {
+    // pgrep exits non-zero when nothing matches.
+    return false;
+  }
+}
+
+// Fold what VLC currently remembers into the store, then work out which
+// forgotten videos were forgotten because they finished.
+async function absorbPositions(positions) {
+  let changed = false;
+
+  for (const [target, seconds] of positions) {
+    const record = watched.get(target);
+    if (record && record.seconds === seconds && !record.finished && !record.superseded) continue;
+    // A live resume point outranks every guess: this video is part-watched, and
+    // whatever was observed on an earlier pass is stale.
+    remember(target, { seconds, finished: false, played: 0 });
+    changed = true;
+  }
+
+  // VLC playing on past a video is how it says that video ran out.
+  for (const [target, record] of watched) {
+    if (!record.superseded || positions.has(target)) continue;
+    remember(target, { ...record, finished: true, superseded: false });
+    changed = true;
+  }
+
+  const vlcRunning = await isVlcRunning();
+
+  for (const queue of queues) {
+    // The furthest item VLC has ever held a position for: everything before it
+    // in the queue was played through.
+    let seen = typeof queue.maxSeen === 'number' ? queue.maxSeen : -1;
+    for (let i = queue.paths.length - 1; i > seen; i -= 1) {
+      if (positions.has(queue.paths[i])) {
+        seen = i;
+        break;
+      }
+    }
+
+    if (seen !== queue.maxSeen) {
+      queue.maxSeen = seen;
+      changed = true;
+    }
+
+    // Items the queue has moved past are certainly finished. The furthest one
+    // is not: VLC may simply have pushed it out of its capped list, and a
+    // half-watched video wrongly shown as done is worse than a stale bar.
+    // A queue of one is the exception — nothing can have moved past it, so
+    // once VLC has quit without a resume point, it played to the end. This is
+    // the guess made when the app was closed during playback; if the watcher
+    // was up, how long the video actually ran decides instead.
+    const lonely = queue.paths.length === 1 && !vlcRunning && !watched.get(queue.paths[0])?.played;
+    const limit = lonely ? 0 : seen - 1;
+
+    for (let i = 0; i <= limit; i += 1) {
+      const target = queue.paths[i];
+      if (positions.has(target)) continue;
+
+      const record = watched.get(target);
+      if (record && record.finished) continue;
+      remember(target, { ...record, seconds: record ? record.seconds : 0, finished: true });
+      changed = true;
+    }
+  }
+
+  if (changed) saveWatched();
+}
+
+// --- Playback watch ------------------------------------------------------
+// VLC only writes a resume point when it stops part-way through a video, and
+// not even then if barely any of it played, so its preferences alone cannot
+// say what was watched. Asking the running VLC which file it holds open fills
+// that in: the video it moves on from ran to the end, and time spent open
+// says whether the last one did.
+
+const WATCH_INTERVAL = 10000;
+const VLC_PROCESS = process.platform === 'darwin' ? 'VLC' : 'vlc';
+
+let watchTimer = null;
+// Videos VLC has open right now, and when each was last seen.
+let openVideos = new Map();
+
+// The video files a running VLC has open, or null when VLC is not running.
+async function openVlcVideos() {
+  let pids;
+  try {
+    const { stdout } = await execFileAsync('pgrep', ['-x', VLC_PROCESS]);
+    pids = stdout.trim().split('\n').filter(Boolean);
+  } catch {
+    return null;
+  }
+
+  const open = new Set();
+  for (const pid of pids) {
+    try {
+      const { stdout } = await execFileAsync('lsof', ['-p', pid, '-Fn'], { maxBuffer: 16 * 1024 * 1024 });
+      for (const line of stdout.split('\n')) {
+        // -Fn prints one field per line; the name field is `n` then the path.
+        if (line[0] !== 'n' || line[1] !== '/') continue;
+        const file = line.slice(1);
+        if (isVideoFile(file)) open.add(path.resolve(file));
+      }
+    } catch {
+      // VLC quit between the two calls.
+    }
+  }
+
+  return open;
+}
+
+async function pollPlayback() {
+  const open = await openVlcVideos();
+  const now = Date.now();
+
+  if (!open) {
+    if (!openVideos.size) return;
+    // VLC has quit: it has just written its resume points, so read them now
+    // rather than waiting for the window to be focused.
+    openVideos.clear();
+    await refreshProgressBars();
+    return;
+  }
+
+  let changed = false;
+
+  for (const target of open) {
+    const since = openVideos.get(target);
+    openVideos.set(target, now);
+    if (!since) continue;
+
+    const record = watched.get(target) || { seconds: 0, finished: false, played: 0 };
+    remember(target, { ...record, played: (record.played || 0) + (now - since) / 1000 });
+    changed = true;
+  }
+
+  for (const target of [...openVideos.keys()]) {
+    if (open.has(target)) continue;
+    openVideos.delete(target);
+
+    // Closed while another video is open: VLC moved on, so this one ran out.
+    // Whether VLC kept a resume point decides it, on the next read.
+    const record = watched.get(target);
+    if (!open.size || (record && record.finished)) continue;
+    remember(target, { seconds: 0, played: 0, ...record, superseded: true });
+    changed = true;
+  }
+
+  if (changed) {
+    saveWatched();
+    await refreshProgressBars();
+  }
+}
+
+// Re-read VLC's side and let every open gallery redraw its bars.
+async function refreshProgressBars() {
+  vlcPositionsReadAt = 0;
+  await readVlcPositions();
+  for (const win of BrowserWindow.getAllWindows()) {
+    win.webContents.send('library-progress-changed');
+  }
+}
+
+function startPlaybackWatch() {
+  if (watchTimer) return;
+  watchTimer = setInterval(() => { pollPlayback().catch(() => {}); }, WATCH_INTERVAL);
+}
+
+// Remembered so the bars can tell a finished video from one never reached.
+function rememberQueue(paths) {
+  queues = queues.filter((queue) => queue.paths[0] !== paths[0]);
+  queues.push({ paths, maxSeen: -1, at: Date.now() });
+  while (queues.length > MAX_QUEUES) queues.shift();
+  saveWatched();
 }
 
 // --- Thumbnails ----------------------------------------------------------
@@ -281,16 +494,35 @@ async function durationFor(videoPath) {
   return duration;
 }
 
-// How far into the video VLC was when it last quit, as a 0-1 fraction.
+// How far into the video playback has reached, as a 0-1 fraction. Reading
+// refreshes the store first, so a bar only ever moves forward.
 async function progressFor(videoPath) {
-  const positions = await readVlcPositions();
-  const seconds = positions.get(path.resolve(videoPath));
-  if (!seconds) return null;
+  await readVlcPositions();
+
+  const record = watched.get(path.resolve(videoPath));
+  if (!record) return null;
 
   const duration = await durationFor(videoPath);
   if (!duration) return null;
 
-  return { seconds, duration, ratio: Math.min(seconds / duration, 1) };
+  if (record.finished) return { seconds: duration, duration, ratio: 1, finished: true };
+
+  // Nearly everything still unwatched has now run, and VLC kept no new resume
+  // point: the video played out. Measuring against what was left, rather than
+  // the whole runtime, catches a video picked up where it was left off.
+  const left = Math.max(duration - (record.seconds || 0), 0);
+  if (record.played >= Math.max(left * FINISHED_RATIO, MIN_PLAYED)) {
+    remember(path.resolve(videoPath), { ...record, finished: true });
+    saveWatched();
+    return { seconds: duration, duration, ratio: 1, finished: true };
+  }
+
+  // Otherwise VLC's resume point is where the video stands.
+  if (record.seconds) {
+    return { seconds: record.seconds, duration, ratio: Math.min(record.seconds / duration, 1) };
+  }
+
+  return null;
 }
 
 // A folder is represented by the same video its thumbnail came from.
@@ -389,6 +621,81 @@ async function checkDependencies() {
   return missingDependencies;
 }
 
+// Subtitle downloads land in the library root, next to the videos they belong
+// to. A name already taken gets a numeric suffix rather than being overwritten.
+function freeDownloadPath(dir, filename) {
+  const safe = path.basename(filename || 'download').replace(/[/\\]/g, '_') || 'download';
+  const ext = path.extname(safe);
+  const stem = safe.slice(0, safe.length - ext.length) || 'download';
+
+  let candidate = path.join(dir, safe);
+  for (let n = 2; fs.existsSync(candidate); n += 1) candidate = path.join(dir, `${stem} (${n})${ext}`);
+  return candidate;
+}
+
+// A download worth connecting to a video: the subtitle itself, or the zip
+// subtitle sites wrap it in.
+const isSubtitleDownload = (file) => {
+  const ext = path.extname(file).toLowerCase();
+  return ext === '.zip' || SUBTITLE_EXTENSIONS.includes(ext);
+};
+
+// Prefer .srt, and among equals the biggest file — multi-part archives keep
+// their largest track for the feature, with the rest being samples or notes.
+function pickSubtitle(files) {
+  const ranked = files
+    .map((file) => ({ ...file, rank: SUBTITLE_EXTENSIONS.indexOf(path.extname(file.name).toLowerCase()) }))
+    .filter((file) => file.rank >= 0)
+    .sort((a, b) => (a.rank === b.rank ? b.size - a.size : a.rank - b.rank));
+
+  return ranked[0] || null;
+}
+
+// Moves across a device boundary, which a plain rename cannot do: the archive
+// is unpacked in the system temp folder, the library may be another disk.
+async function moveFile(from, to) {
+  try {
+    await fsp.rename(from, to);
+  } catch {
+    await fsp.copyFile(from, to);
+    await fsp.unlink(from);
+  }
+}
+
+// Unpack the archive, keep only its subtitle under the video's own name, and
+// clear away the archive and everything else that came with it.
+async function attachSubtitle(archivePath, videoPath) {
+  const target = `${videoPath.slice(0, videoPath.length - path.extname(videoPath).length)}`;
+
+  if (path.extname(archivePath).toLowerCase() !== '.zip') {
+    const subtitle = `${target}${path.extname(archivePath).toLowerCase()}`;
+    await moveFile(archivePath, subtitle);
+    return subtitle;
+  }
+
+  const workDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'subtitle-'));
+  try {
+    // -j flattens the archive's own folders, so every file lands in one place.
+    await execFileAsync('unzip', ['-o', '-j', '-q', archivePath, '-d', workDir]);
+
+    const names = await fsp.readdir(workDir);
+    const files = await Promise.all(names.map(async (name) => ({
+      name,
+      size: await fsp.stat(path.join(workDir, name)).then((stat) => stat.size, () => 0)
+    })));
+
+    const chosen = pickSubtitle(files);
+    if (!chosen) throw new Error('the archive holds no subtitle file');
+
+    const subtitle = `${target}${path.extname(chosen.name).toLowerCase()}`;
+    await moveFile(path.join(workDir, chosen.name), subtitle);
+    await fsp.rm(archivePath, { force: true });
+    return subtitle;
+  } finally {
+    await fsp.rm(workDir, { recursive: true, force: true });
+  }
+}
+
 function createWindow() {
   const win = new BrowserWindow({
     width: 1280,
@@ -405,24 +712,61 @@ function createWindow() {
   if (isBlocked()) win.loadFile(BLOCKED_FILE, { query: { missing: missingDependencies.join(',') } });
   else win.loadURL(HOME_URL);
 
+  // Every site is browsed in the window itself, sign-in flows on other domains
+  // included; a link meant for a new tab simply takes the window with it.
   win.webContents.setWindowOpenHandler(({ url }) => {
-    if (isInternal(url)) {
-      win.loadURL(url);
-    } else {
-      shell.openExternal(url);
-    }
+    win.loadURL(url);
     return { action: 'deny' };
   });
 
   win.on('focus', () => win.webContents.send('library-progress-changed'));
 
-  win.webContents.on('will-navigate', (event, url) => {
-    if (!isInternal(url)) {
-      event.preventDefault();
-      shell.openExternal(url);
+  // Subtitle sites hand the file over through an ad interstitial, which leaves
+  // the window on a blank page once the download takes over. Save the file into
+  // the library and step back to the page the download was started from.
+  win.webContents.session.on('will-download', (event, item) => {
+    const status = (text, failed) => win.webContents.send('download-status', { text, failed });
+
+    if (!libraryPath) {
+      item.cancel();
+      status('Pick a library folder before downloading.', true);
+      return;
     }
+
+    const target = freeDownloadPath(libraryPath, item.getFilename());
+    item.setSavePath(target);
+    status(`Downloading ${path.basename(target)}…`);
+
+    // Clicking the link navigates to the file itself, which commits and then
+    // hands off to the download, leaving an empty page behind. Only that case
+    // needs undoing: a download that left the page alone is not in the chain.
+    const chain = item.getURLChain();
+    const history = win.webContents.navigationHistory;
+    if (chain.includes(win.webContents.getURL()) && history && history.canGoBack()) {
+      setImmediate(() => history.goBack());
+    }
+
+    item.once('done', (doneEvent, state) => {
+      if (state !== 'completed') {
+        status(`Download ${state} (${path.basename(target)}).`, true);
+        return;
+      }
+
+      status(`Saved ${path.basename(target)} to the library folder.`);
+      // Subtitles are only useful once they sit beside their video under its
+      // name, so the window asks which video this one belongs to.
+      if (isSubtitleDownload(target)) {
+        win.webContents.send('subtitle-downloaded', { archive: target, name: path.basename(target) });
+      }
+    });
   });
+
 }
+
+// English-only filter for OpenSubtitles. The site accepts it either as a query
+// parameter or as a path segment, so it is matched to the base URL's shape —
+// appending the path form to a query-style base makes the site ignore it.
+const subtitleSuffix = (base) => (base.includes('?') ? '&SubLanguageID=eng' : '/sublanguageid-eng');
 
 // Replace the current page with a search built from the title.
 function runSearch(event, key, query) {
@@ -433,7 +777,8 @@ function runSearch(event, key, query) {
   const term = query.replace(/[^a-zA-Z0-9]+/g, ' ').trim().slice(0, 300).trim();
   if (!term) return;
 
-  event.sender.loadURL(`${baseUrls[key]}${encodeURIComponent(term)}`);
+  const suffix = key === 'subtitle' ? subtitleSuffix(baseUrls[key]) : '';
+  event.sender.loadURL(`${baseUrls[key]}${encodeURIComponent(term)}${suffix}`);
 }
 
 ipcMain.on('inspect-search', (event, query) => runSearch(event, 'inspect', query));
@@ -479,8 +824,6 @@ ipcMain.handle('set-base-url', (event, key, value) => {
   return { ok: true, baseUrls };
 });
 
-ipcMain.handle('get-library-path', () => libraryPath);
-
 ipcMain.handle('pick-library-folder', async (event) => {
   if (isBlocked()) return { ok: false, reason: 'blocked', libraryPath };
 
@@ -507,6 +850,23 @@ ipcMain.handle('open-local-gallery', (event) => {
 });
 
 // Folders and video files inside the library, folders first.
+ipcMain.handle('attach-subtitle', async (event, archivePath, videoPath) => {
+  if (isBlocked()) return { ok: false, reason: 'blocked' };
+  if (!libraryPath) return { ok: false, reason: 'no-library' };
+
+  const archive = insideLibrary(archivePath);
+  const video = insideLibrary(videoPath);
+  if (!archive || !video) return { ok: false, reason: 'outside-library' };
+  if (!isVideoFile(video)) return { ok: false, reason: 'not-a-video' };
+
+  try {
+    const subtitle = await attachSubtitle(archive, video);
+    return { ok: true, subtitle: path.basename(subtitle) };
+  } catch (error) {
+    return { ok: false, reason: 'failed', message: error.message };
+  }
+});
+
 ipcMain.handle('read-library-dir', async (event, dirPath) => {
   if (isBlocked()) return { ok: false, reason: 'blocked' };
   if (!libraryPath) return { ok: false, reason: 'no-library' };
@@ -579,8 +939,34 @@ ipcMain.handle('get-progress', async (event, entries) => {
   return results;
 });
 
-// Hand the file to the VLC installed on this machine.
-ipcMain.handle('open-in-vlc', (event, filePath) => {
+// How many videos may follow the clicked one into VLC's playlist.
+const MAX_QUEUE = 100;
+
+// Everything after the clicked video in its own folder, in the order the
+// gallery shows it. VLC plays the list straight through, so finishing one
+// video rolls on to the next by itself.
+async function queueFrom(videoPath) {
+  let dirents;
+  try {
+    dirents = await fsp.readdir(path.dirname(videoPath), { withFileTypes: true });
+  } catch {
+    return [videoPath];
+  }
+
+  const siblings = dirents
+    .filter((dirent) => !dirent.isDirectory() && !dirent.name.startsWith('.') && isVideoFile(dirent.name))
+    .map((dirent) => path.join(path.dirname(videoPath), dirent.name))
+    .sort((a, b) => path.basename(a).localeCompare(path.basename(b), undefined, { numeric: true, sensitivity: 'base' }));
+
+  const start = siblings.indexOf(videoPath);
+  // A file that vanished between listing and click still plays on its own.
+  if (start === -1) return [videoPath];
+
+  return siblings.slice(start, start + MAX_QUEUE);
+}
+
+// Hand the file, and the rest of its folder, to the VLC installed here.
+ipcMain.handle('open-in-vlc', async (event, filePath) => {
   if (isBlocked()) return { ok: false, reason: 'blocked' };
 
   const target = insideLibrary(filePath);
@@ -588,9 +974,13 @@ ipcMain.handle('open-in-vlc', (event, filePath) => {
     return { ok: false, reason: 'not-a-library-video' };
   }
 
+  const queue = await queueFrom(target);
+  rememberQueue(queue);
+  setTimeout(() => { pollPlayback().catch(() => {}); }, 4000);
+
   const [command, args] = process.platform === 'darwin'
-    ? ['open', ['-a', 'VLC', target]]
-    : ['vlc', [target]];
+    ? ['open', ['-a', 'VLC', ...queue]]
+    : ['vlc', queue];
 
   // `open` reports a missing app on stderr; elsewhere the binary itself is absent.
   const isMissing = (error) => error.code === 'ENOENT' || /unable to find application/i.test(error.message);
@@ -623,12 +1013,78 @@ ipcMain.handle('open-in-vlc', (event, filePath) => {
   });
 });
 
+// Caches keyed by path outlive the file, so drop anything under a deleted
+// entry before the gallery asks about it again.
+function forgetCached(target) {
+  const prefix = target + path.sep;
+  const isGone = (value) => value === target || value.startsWith(prefix);
+
+  for (const key of durationCache.keys()) {
+    if (isGone(key)) durationCache.delete(key);
+  }
+  for (const [key, videoPath] of folderVideoCache) {
+    if (isGone(key) || (videoPath && isGone(videoPath))) folderVideoCache.delete(key);
+  }
+  for (const key of watched.keys()) {
+    if (isGone(key)) watched.delete(key);
+  }
+  queues = queues.filter((queue) => !queue.paths.some(isGone));
+  saveWatched();
+}
+
+// Deleting is the one destructive thing the gallery can do, so it asks first
+// and then goes to the Trash rather than unlinking outright.
+ipcMain.handle('delete-library-entry', async (event, entryPath) => {
+  if (isBlocked()) return { ok: false, reason: 'blocked' };
+
+  const target = insideLibrary(entryPath);
+  if (!target) return { ok: false, reason: 'outside-library' };
+  if (target === path.resolve(libraryPath)) return { ok: false, reason: 'is-library-root' };
+
+  let isDirectory;
+  try {
+    isDirectory = (await fsp.stat(target)).isDirectory();
+  } catch (error) {
+    return { ok: false, reason: 'unreadable', message: error.message };
+  }
+
+  const win = BrowserWindow.fromWebContents(event.sender);
+  const options = {
+    type: 'warning',
+    title: 'Move to Trash',
+    message: `Move "${path.basename(target)}" to the Trash?`,
+    detail: isDirectory
+      ? `The folder and everything inside it goes to the Trash:\n${target}`
+      : target,
+    buttons: ['Move to Trash', 'Cancel'],
+    defaultId: 1,
+    cancelId: 1
+  };
+
+  const { response } = win
+    ? await dialog.showMessageBox(win, options)
+    : await dialog.showMessageBox(options);
+  if (response !== 0) return { ok: false, reason: 'canceled' };
+
+  try {
+    await shell.trashItem(target);
+  } catch (error) {
+    return { ok: false, reason: 'delete-failed', message: error.message };
+  }
+
+  forgetCached(target);
+  return { ok: true };
+});
+
 app.whenReady().then(async () => {
   loadSettings();
+  progressFile = path.join(app.getPath('userData'), 'progress.json');
+  loadWatched();
   thumbnailDir = path.join(app.getPath('userData'), 'thumbnails');
   fs.mkdirSync(thumbnailDir, { recursive: true });
   await checkDependencies();
   createWindow();
+  startPlaybackWatch();
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) createWindow();
   });
