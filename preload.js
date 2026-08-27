@@ -500,14 +500,36 @@ const BLOCKED_STYLE = `
   .bl-wrap { max-width: 640px; padding: 64px 32px; margin: 0 auto; }
   .bl-title { margin: 0 0 12px; font-size: 20px; color: #f5c518; }
   .bl-text { margin: 0 0 20px; color: #ccc; }
-  .bl-list { margin: 0 0 20px; padding-left: 20px; color: #eee; }
-  .bl-hint { margin: 0 0 24px; color: #999; font-size: 13px; }
-  .bl-hint code { color: #eee; font-family: Menlo, Consolas, monospace; }
+  .bl-list { margin: 0 0 24px; padding: 0; list-style: none; color: #eee; }
+  .bl-item { margin: 0 0 18px; }
+  .bl-what { color: #999; font-size: 13px; }
+  .bl-cmd {
+    display: block; margin-top: 8px; padding: 8px 10px;
+    font: 400 13px/1.4 Menlo, Consolas, monospace; color: #f5c518;
+    background: #1e1e1e; border: 1px solid #2f2f2f; border-radius: 4px; user-select: all;
+  }
+  .bl-hint { margin: 0 0 24px; color: #777; font-size: 12px; }
   .bl-button {
     padding: 8px 16px; font: 600 13px/1.4 Arial, Helvetica, sans-serif;
     color: #000; background: #f5c518; border: none; border-radius: 4px; cursor: pointer;
   }
 `;
+
+// What each missing tool is for, and the one command that installs it.
+const INSTALL_GUIDE = {
+  ffmpeg: {
+    what: 'grabs the scene shown on each tile',
+    command: 'brew install ffmpeg'
+  },
+  ffprobe: {
+    what: 'reads video length for the progress bar (ships with ffmpeg)',
+    command: 'brew install ffmpeg'
+  },
+  VLC: {
+    what: 'plays the videos you click',
+    command: 'brew install --cask vlc'
+  }
+};
 
 function startBlocked(root) {
   const style = document.createElement('style');
@@ -531,9 +553,26 @@ function startBlocked(root) {
 
   const showMissing = (missing) => {
     list.textContent = '';
+
     for (const name of missing) {
+      const guide = INSTALL_GUIDE[name];
+      if (!guide) continue;
+
       const item = document.createElement('li');
-      item.textContent = `${name} — not found`;
+      item.className = 'bl-item';
+
+      const heading = document.createElement('strong');
+      heading.textContent = `${name} — not found`;
+
+      const what = document.createElement('span');
+      what.className = 'bl-what';
+      what.textContent = ` · ${guide.what}`;
+
+      const command = document.createElement('code');
+      command.className = 'bl-cmd';
+      command.textContent = guide.command;
+
+      item.append(heading, what, command);
       list.append(item);
     }
   };
@@ -542,10 +581,8 @@ function startBlocked(root) {
 
   const hint = document.createElement('p');
   hint.className = 'bl-hint';
-  hint.append('Install ffmpeg with ');
-  const code = document.createElement('code');
-  code.textContent = 'brew install ffmpeg';
-  hint.append(code, ', and VLC from videolan.org.');
+  hint.textContent = 'No Homebrew? Install it from brew.sh first, or download VLC directly '
+    + 'from videolan.org. Then use Check again.';
 
   const recheck = document.createElement('button');
   recheck.type = 'button';
