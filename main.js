@@ -7,7 +7,15 @@ const os = require('os');
 const path = require('path');
 const { promisify } = require('util');
 
+const vendor = require('./scripts/vendor');
+
 const execFileAsync = promisify(execFile);
+
+// ffmpeg, ffprobe and VLC are kept inside the project so no install on the
+// machine is needed. In development that folder sits next to this file; a
+// packaged build carries it in its resources instead.
+const VENDOR_ROOT = app.isPackaged ? process.resourcesPath : __dirname;
+const VENDOR = vendor.vendorPaths(VENDOR_ROOT);
 
 const HOME_URL = 'https://www.imdb.com';
 const GALLERY_FILE = path.join(__dirname, 'gallery.html');
@@ -26,7 +34,8 @@ const VIDEO_EXTENSIONS = new Set([
 ]);
 
 // A GUI-launched app does not inherit a shell PATH, so look in the usual
-// Homebrew locations as well.
+// Homebrew locations as well. The downloaded copies come first, since those
+// are the only ones this app can vouch for.
 const FFMPEG_CANDIDATES = ['/opt/homebrew/bin', '/usr/local/bin', '/usr/bin'];
 
 // Thumbnails: how deep to hunt for a folder's first video, and how many
@@ -42,7 +51,9 @@ let thumbnailDir;
 let baseUrls = { ...DEFAULT_BASE_URLS };
 let libraryPath = '';
 let ffmpegTools = null;
+let vlcPath = '';
 let missingDependencies = [];
+let installing = null;
 
 // Nothing this app does works without its outside tools, so every entry point
 // stays shut until they are all present.
@@ -373,7 +384,7 @@ function rememberQueue(paths) {
 async function findFfmpegTools() {
   if (ffmpegTools) return ffmpegTools;
 
-  for (const dir of ['', ...FFMPEG_CANDIDATES]) {
+  for (const dir of [VENDOR.binDir, '', ...FFMPEG_CANDIDATES]) {
     const ffmpeg = dir ? path.join(dir, 'ffmpeg') : 'ffmpeg';
     const ffprobe = dir ? path.join(dir, 'ffprobe') : 'ffprobe';
     try {
@@ -595,7 +606,7 @@ async function findVlc() {
     }
   }
 
-  const bundles = ['/Applications/VLC.app', path.join(os.homedir(), 'Applications', 'VLC.app')];
+  const bundles = [VENDOR.vlcApp, '/Applications/VLC.app', path.join(os.homedir(), 'Applications', 'VLC.app')];
   const installed = bundles.find((bundle) => fs.existsSync(bundle));
   if (installed) return installed;
 
@@ -609,8 +620,10 @@ async function findVlc() {
 }
 
 async function checkDependencies() {
+  ffmpegTools = null;
   const { ffmpeg, ffprobe } = await findFfmpegTools();
   const vlc = await findVlc();
+  vlcPath = vlc;
 
   missingDependencies = [
     ffmpeg ? '' : 'ffmpeg',
@@ -970,6 +983,29 @@ ipcMain.handle('recheck-dependencies', async (event) => {
   return missing;
 });
 
+// Fetch whatever is missing into `vendor`. The blocked page asks for this as
+// soon as it opens, and watches 'dependency-progress' while it runs. A second
+// window asking mid-download joins the run already going rather than starting
+// its own.
+ipcMain.handle('install-dependencies', async (event) => {
+  if (!installing) {
+    const report = (info) => {
+      for (const win of BrowserWindow.getAllWindows()) {
+        win.webContents.send('dependency-progress', info);
+      }
+    };
+
+    installing = vendor.ensureVendorTools(VENDOR_ROOT, report)
+      .then(async (result) => ({ ...result, missing: await checkDependencies() }))
+      .catch((error) => ({ installed: [], failures: [{ name: 'setup', message: error.message }], missing: missingDependencies }))
+      .finally(() => { installing = null; });
+  }
+
+  const result = await installing;
+  if (!result.missing.length && !event.sender.isDestroyed()) event.sender.loadURL(HOME_URL);
+  return result;
+});
+
 ipcMain.handle('set-base-url', (event, key, value) => {
   if (isBlocked()) return { ok: false, reason: 'blocked', baseUrls };
 
@@ -1135,9 +1171,12 @@ ipcMain.handle('open-in-vlc', async (event, filePath) => {
   rememberQueue(queue);
   setTimeout(() => { pollPlayback().catch(() => {}); }, 4000);
 
+  // Launch the copy that was actually found: the downloaded bundle when there
+  // is one, and only otherwise whatever the machine happens to have.
+  const player = vlcPath || await findVlc();
   const [command, args] = process.platform === 'darwin'
-    ? ['open', ['-a', 'VLC', ...queue]]
-    : ['vlc', queue];
+    ? ['open', ['-a', player || 'VLC', ...queue]]
+    : [player || 'vlc', queue];
 
   // `open` reports a missing app on stderr; elsewhere the binary itself is absent.
   const isMissing = (error) => error.code === 'ENOENT' || /unable to find application/i.test(error.message);

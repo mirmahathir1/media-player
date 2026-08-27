@@ -1,21 +1,2 @@
-# Dependencies
 node_modules/
-
-# Build output
-dist/
-out/
-build/
-
-# Logs
-*.log
-npm-debug.log*
-yarn-error.log*
-
-# Editor and OS cruft
-.DS_Store
-.vscode/
-.idea/
-
-# Local environment
-.env
-.env.local
+vendor/

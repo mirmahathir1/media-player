@@ -934,16 +934,26 @@ function startGallery(root) {
 }
 
 // --- Missing requirements ------------------------------------------------
-// Shown instead of the app when ffmpeg, ffprobe or VLC is absent. Nothing
-// else is rendered, so there is nothing to click but "Check again".
+// ffmpeg, ffprobe and VLC are kept in the project's vendor folder rather than
+// installed on the machine. When any of them is absent this page takes over,
+// downloads what is missing, and hands the window back to the app. Nothing
+// else is rendered, so there is nothing to click while it runs.
 
 const BLOCKED_STYLE = `
   .bl-wrap { max-width: 640px; padding: 64px 32px; margin: 0 auto; }
   .bl-title { margin: 0 0 12px; font-size: 20px; color: #f5c518; }
-  .bl-text { margin: 0 0 20px; color: #ccc; }
+  .bl-text { margin: 0 0 24px; color: #ccc; }
   .bl-list { margin: 0 0 24px; padding: 0; list-style: none; color: #eee; }
   .bl-item { margin: 0 0 18px; }
   .bl-what { color: #999; font-size: 13px; }
+  .bl-status { margin-top: 4px; color: #999; font-size: 13px; }
+  .bl-status.is-done { color: #7ec87e; }
+  .bl-status.is-failed { color: #e07a7a; }
+  .bl-bar {
+    height: 4px; margin-top: 8px; border-radius: 2px;
+    background: #2f2f2f; overflow: hidden;
+  }
+  .bl-fill { height: 100%; width: 0; background: #f5c518; transition: width 120ms linear; }
   .bl-cmd {
     display: block; margin-top: 8px; padding: 8px 10px;
     font: 400 13px/1.4 Menlo, Consolas, monospace; color: #f5c518;
@@ -954,9 +964,11 @@ const BLOCKED_STYLE = `
     padding: 8px 16px; font: 600 13px/1.4 Arial, Helvetica, sans-serif;
     color: #000; background: #f5c518; border: none; border-radius: 4px; cursor: pointer;
   }
+  .bl-button[disabled] { opacity: 0.5; cursor: default; }
 `;
 
-// What each missing tool is for, and the one command that installs it.
+// What each tool is for, and the one command that installs it by hand should
+// the download keep failing.
 const INSTALL_GUIDE = {
   ffmpeg: {
     what: 'grabs the scene shown on each tile',
@@ -972,6 +984,8 @@ const INSTALL_GUIDE = {
   }
 };
 
+const megabytes = (bytes) => `${(bytes / 1e6).toFixed(0)} MB`;
+
 function startBlocked(root) {
   const style = document.createElement('style');
   style.textContent = BLOCKED_STYLE;
@@ -982,18 +996,32 @@ function startBlocked(root) {
 
   const title = document.createElement('h1');
   title.className = 'bl-title';
-  title.textContent = 'Missing requirements';
+  title.textContent = 'Setting up';
 
   const text = document.createElement('p');
   text.className = 'bl-text';
-  text.textContent = 'This app needs ffmpeg, ffprobe and VLC installed on this machine. '
-    + 'Everything stays disabled until all three are found.';
+  text.textContent = 'These are downloaded into the app\u2019s own vendor folder, not installed '
+    + 'on this machine. It runs once and takes a few minutes.';
 
   const list = document.createElement('ul');
   list.className = 'bl-list';
 
+  const hint = document.createElement('p');
+  hint.className = 'bl-hint';
+  hint.hidden = true;
+
+  const retry = document.createElement('button');
+  retry.type = 'button';
+  retry.className = 'bl-button';
+  retry.textContent = 'Retry';
+  retry.hidden = true;
+
+  // One row per missing tool, kept by name so progress can find its own line.
+  const rows = new Map();
+
   const showMissing = (missing) => {
     list.textContent = '';
+    rows.clear();
 
     for (const name of missing) {
       const guide = INSTALL_GUIDE[name];
@@ -1003,41 +1031,88 @@ function startBlocked(root) {
       item.className = 'bl-item';
 
       const heading = document.createElement('strong');
-      heading.textContent = `${name} — not found`;
+      heading.textContent = name;
 
       const what = document.createElement('span');
       what.className = 'bl-what';
-      what.textContent = ` · ${guide.what}`;
+      what.textContent = ` \u00b7 ${guide.what}`;
 
-      const command = document.createElement('code');
-      command.className = 'bl-cmd';
-      command.textContent = guide.command;
+      const status = document.createElement('div');
+      status.className = 'bl-status';
+      status.textContent = 'waiting';
 
-      item.append(heading, what, command);
+      const bar = document.createElement('div');
+      bar.className = 'bl-bar';
+      const fill = document.createElement('div');
+      fill.className = 'bl-fill';
+      bar.append(fill);
+
+      item.append(heading, what, status, bar);
       list.append(item);
+      rows.set(name, { status, fill, command: guide.command });
     }
   };
 
-  showMissing((new URLSearchParams(location.search).get('missing') || '').split(',').filter(Boolean));
+  const setStatus = (name, message, { ratio = null, state = '' } = {}) => {
+    const row = rows.get(name);
+    if (!row) return;
 
-  const hint = document.createElement('p');
-  hint.className = 'bl-hint';
-  hint.textContent = 'No Homebrew? Install it from brew.sh first, or download VLC directly '
-    + 'from videolan.org. Then use Check again.';
+    row.status.textContent = message;
+    row.status.className = `bl-status${state ? ` is-${state}` : ''}`;
+    if (ratio !== null) row.fill.style.width = `${Math.round(ratio * 100)}%`;
+  };
 
-  const recheck = document.createElement('button');
-  recheck.type = 'button';
-  recheck.className = 'bl-button';
-  recheck.textContent = 'Check again';
-  recheck.addEventListener('click', async () => {
-    recheck.disabled = true;
-    const missing = await ipcRenderer.invoke('recheck-dependencies');
-    showMissing(missing);
-    recheck.disabled = false;
+  // Every phase the vendor download reports, turned into one line of text.
+  ipcRenderer.on('dependency-progress', (event, info) => {
+    if (info.phase === 'start') setStatus(info.name, 'starting', { ratio: 0 });
+    else if (info.phase === 'lookup') setStatus(info.name, 'finding the latest build');
+    else if (info.phase === 'download') {
+      const label = info.total
+        ? `downloading \u00b7 ${megabytes(info.received)} of ${megabytes(info.total)}`
+        : `downloading \u00b7 ${megabytes(info.received)}`;
+      setStatus(info.name, label, { ratio: info.total ? info.received / info.total : null });
+    } else if (info.phase === 'verify') setStatus(info.name, 'checking the download', { ratio: 1 });
+    else if (info.phase === 'install') setStatus(info.name, 'unpacking', { ratio: 1 });
+    else if (info.phase === 'done') setStatus(info.name, 'ready', { ratio: 1, state: 'done' });
+    else if (info.phase === 'failed') setStatus(info.name, `failed \u00b7 ${info.message}`, { ratio: 0, state: 'failed' });
   });
 
-  wrap.append(title, text, list, hint, recheck);
+  // Anything that could not be fetched falls back to the manual route, with
+  // the commands that install it by hand.
+  const showFallback = (failures) => {
+    hint.textContent = 'Some of it could not be downloaded. Check the connection and retry, '
+      + 'or install by hand: '
+      + failures.map((failure) => (INSTALL_GUIDE[failure.name] || {}).command)
+        .filter(Boolean).filter((cmd, i, all) => all.indexOf(cmd) === i).join(' and ')
+      + '.';
+    hint.hidden = false;
+    retry.hidden = false;
+  };
+
+  // The window is handed back to the app by the main process as soon as
+  // nothing is missing, so a clean run ends this page on its own.
+  const install = async () => {
+    retry.disabled = true;
+    hint.hidden = true;
+
+    const result = await ipcRenderer.invoke('install-dependencies');
+    if (!result.missing.length) return;
+
+    showMissing(result.missing);
+    for (const failure of result.failures) {
+      setStatus(failure.name, `failed \u00b7 ${failure.message}`, { state: 'failed' });
+    }
+    showFallback(result.failures.length ? result.failures : result.missing.map((name) => ({ name })));
+    retry.disabled = false;
+  };
+
+  retry.addEventListener('click', install);
+
+  showMissing((new URLSearchParams(location.search).get('missing') || '').split(',').filter(Boolean));
+  wrap.append(title, text, list, hint, retry);
   root.append(wrap);
+
+  install();
 }
 
 function start() {

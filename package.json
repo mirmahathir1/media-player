@@ -4,7 +4,9 @@
   "description": "Electron wrapper for imdb.com",
   "main": "main.js",
   "scripts": {
-    "start": "electron ."
+    "start": "electron .",
+    "vendor": "node scripts/vendor.js",
+    "postinstall": "node scripts/vendor.js || exit 0"
   },
   "devDependencies": {
     "electron": "^32.0.0"
