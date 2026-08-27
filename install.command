@@ -26,6 +26,20 @@ checkout_dir() {
   printf '%s' "$dir"
 }
 
+# Custom file icons live in an extended attribute, so git cannot carry one.
+# Stamp it on here instead, straight from the Electron app we just unpacked.
+# JXA reaches NSWorkspace without needing Xcode installed.
+set_icon() {
+  local icon="$1" file="$2"
+  [ -f "$icon" ] && [ -e "$file" ] || return 0
+  osascript -l JavaScript \
+    -e 'ObjC.import("AppKit");' \
+    -e 'const [icon, file] = $.NSProcessInfo.processInfo.arguments.js.slice(-2).map(a => a.js);' \
+    -e 'const image = $.NSImage.alloc.initWithContentsOfFile(icon);' \
+    -e 'if (image.js) $.NSWorkspace.sharedWorkspace.setIconForFileOptions(image, file, 0);' \
+    "$icon" "$file" >/dev/null 2>&1 || true
+}
+
 # The Finder's own folder picker, so running from the web needs no typing.
 ask_for_folder() {
   osascript -e 'POSIX path of (choose folder with prompt "Choose a folder to install IMDb into")' 2>/dev/null
@@ -104,5 +118,14 @@ exec npm start
 LAUNCHER_EOF
 chmod +x "$LAUNCHER"
 echo "$LAUNCHER"
+
+step "Setting the icons"
+ICON="$ELECTRON_DIR/dist/Electron.app/Contents/Resources/electron.icns"
+for FILE in "$LAUNCHER" "$PROJECT_DIR/install.command" "$PROJECT_DIR/uninstall.command"; do
+  set_icon "$ICON" "$FILE"
+done
+# The Finder caches what it has already drawn, so nudge it into a redraw.
+touch "$LAUNCHER"
+echo "done"
 
 printf '\n\033[32mDone.\033[0m Double-click IMDb.command on your Desktop to start the app.\n\n'
