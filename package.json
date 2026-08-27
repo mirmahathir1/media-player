@@ -6,74 +6,12 @@
   "scripts": {
     "start": "electron .",
     "vendor": "node scripts/vendor.js",
-    "postinstall": "node scripts/vendor.js || exit 0",
-    "dist": "electron-builder --mac",
-    "pack": "electron-builder --dir"
+    "postinstall": "node scripts/vendor.js || exit 0"
   },
   "devDependencies": {
-    "electron": "^32.0.0",
-    "electron-builder": "^26.15.3"
+    "electron": "^32.0.0"
   },
   "dependencies": {
     "webtorrent": "^3.0.21"
-  },
-  "build": {
-    "appId": "com.mirmahathir.imdb-desktop",
-    "productName": "IMDb",
-    "directories": {
-      "output": "dist",
-      "buildResources": "build"
-    },
-    "files": [
-      "main.js",
-      "preload.js",
-      "gallery.html",
-      "blocked.html",
-      "scripts/**/*",
-      "package.json",
-      "node_modules/**/*",
-      "!node_modules/**/prebuilds/{win32,linux,android}-*/**",
-      "!node_modules/**/prebuilds/darwin-x64/**",
-      "!node_modules/**/*.{md,markdown,map}",
-      "!node_modules/**/{test,tests,example,examples,.github,docs}/**"
-    ],
-    "asarUnpack": [
-      "**/*.node",
-      "**/node_modules/node-datachannel/**"
-    ],
-    "extraResources": [
-      {
-        "from": "vendor/bin",
-        "to": "vendor/bin"
-      }
-    ],
-    "mac": {
-      "category": "public.app-category.entertainment",
-      "target": [
-        {
-          "target": "dmg",
-          "arch": [
-            "arm64"
-          ]
-        },
-        {
-          "target": "zip",
-          "arch": [
-            "arm64"
-          ]
-        }
-      ],
-      "identity": null,
-      "signIgnore": [
-        "vendor/VLC\\.app"
-      ],
-      "extendInfo": {
-        "NSAppleEventsUsageDescription": "Used to locate VLC and read its playback positions."
-      }
-    },
-    "dmg": {
-      "title": "IMDb"
-    },
-    "afterPack": "build/afterPack.js"
   }
 }

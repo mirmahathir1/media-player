@@ -28,9 +28,3 @@ npm start
 
 Re-running `install.command` is safe at any point: it updates the checkout,
 repairs a half-finished `npm install` and rewrites the Desktop launcher.
-
-## Building a .app
-
-`npm run dist` produces a signed-ad-hoc `.app`, `.dmg` and `.zip` under `dist/`
-for Apple Silicon. Because the build is not notarized, macOS refuses to open a
-downloaded copy, which is why the installer above is the supported route.
