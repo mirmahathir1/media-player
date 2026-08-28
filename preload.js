@@ -49,10 +49,8 @@ let locationLabel;
 let statusLabel;
 let statusTimer;
 let bottomBar;
-let torrentPanel;
 
 // Torrent rows by id, so a redraw updates them in place.
-const torrentRows = new Map();
 
 // The bar's own address line: the current web page's URL. Compared against the
 // label itself, so a rebuilt bar always gets filled in.
@@ -437,119 +435,9 @@ function resizeBar(bar) {
 }
 
 // --- Torrents ------------------------------------------------------------
-// Magnet links go to the main process, which downloads them into the library
-// folder. The bar grows a row per torrent while they run and shrinks back to
-// its usual height once the list empties.
-
-const SIZE_UNITS = ['B', 'KB', 'MB', 'GB', 'TB'];
-
-function humanSize(bytes) {
-  let value = Number(bytes) || 0;
-  let unit = 0;
-  while (value >= 1024 && unit < SIZE_UNITS.length - 1) {
-    value /= 1024;
-    unit += 1;
-  }
-  return `${unit && value < 10 ? value.toFixed(1) : Math.round(value)} ${SIZE_UNITS[unit]}`;
-}
-
-// A magnet names the swarm and nothing else, so the first seconds of a torrent
-// have no name, no size and no percentage worth showing.
-function torrentDetail(torrent) {
-  // A finished torrent leaves the swarm at once, so this is what the row shows
-  // in the moment between the last piece landing and the row going away.
-  if (torrent.done) return `Done · ${humanSize(torrent.length)}`;
-  if (!torrent.length) return `Fetching metadata · ${torrent.peers} peers`;
-
-  return [
-    `${(torrent.progress * 100).toFixed(1)}%`,
-    `${humanSize(torrent.downloaded)} / ${humanSize(torrent.length)}`,
-    `${humanSize(torrent.speed)}/s`,
-    `${torrent.peers} peers`
-  ].join(' · ');
-}
-
-function createTorrentRow(torrent) {
-  const root = document.createElement('div');
-  Object.assign(root.style, { display: 'flex', alignItems: 'center', gap: '10px' });
-
-  const text = document.createElement('div');
-  Object.assign(text.style, { flex: '1 1 auto', minWidth: '0' });
-
-  const name = document.createElement('div');
-  Object.assign(name.style, {
-    overflow: 'hidden',
-    textOverflow: 'ellipsis',
-    whiteSpace: 'nowrap',
-    color: '#eee',
-    font: '600 12px/1.4 Arial, Helvetica, sans-serif'
-  });
-
-  const track = document.createElement('div');
-  Object.assign(track.style, {
-    height: '4px',
-    margin: '5px 0',
-    borderRadius: '2px',
-    background: '#2f2f2f',
-    overflow: 'hidden'
-  });
-
-  const fill = document.createElement('div');
-  Object.assign(fill.style, { height: '100%', width: '0%', background: '#f5c518' });
-  track.append(fill);
-
-  const detail = document.createElement('div');
-  detail.style.color = '#999';
-
-  text.append(name, track, detail);
-
-  // Gives up on a download that has not finished; a finished one takes itself
-  // out of the list without being asked.
-  const stop = createButton('Stop', () => ipcRenderer.invoke('remove-torrent', torrent.id), {
-    ...BUTTON_STYLE,
-    flex: '0 0 auto'
-  });
-
-  root.append(text, stop);
-  return { root, name, fill, detail };
-}
-
-function updateTorrentRow(row, torrent) {
-  const label = torrent.name || 'Starting torrent…';
-  if (row.name.textContent !== label) {
-    row.name.textContent = label;
-    row.name.title = label;
-  }
-  row.fill.style.width = `${(torrent.progress * 100).toFixed(1)}%`;
-  row.detail.textContent = torrentDetail(torrent);
-}
-
-// Rows are kept and updated rather than rebuilt: the list redraws every second,
-// and a rebuild there would throw away the Stop button under the user's cursor.
-function renderTorrents(list) {
-  if (!torrentPanel) return;
-  const before = torrentPanel.offsetHeight;
-
-  for (const [id, row] of torrentRows) {
-    if (list.some((torrent) => torrent.id === id)) continue;
-    row.root.remove();
-    torrentRows.delete(id);
-  }
-
-  for (const torrent of list) {
-    let row = torrentRows.get(torrent.id);
-    if (!row) {
-      row = createTorrentRow(torrent);
-      torrentRows.set(torrent.id, row);
-      torrentPanel.append(row.root);
-    }
-    updateTorrentRow(row, torrent);
-  }
-
-  torrentPanel.style.display = list.length ? 'flex' : 'none';
-  if (bottomBar && torrentPanel.offsetHeight !== before) resizeBar(bottomBar);
-}
-
+// Magnet links go to the main process, which hands them to WebTorrent. That
+// app has a window of its own and reports nothing back, so all this side shows
+// is the one line saying the link was passed on.
 
 function createBottomBar() {
   // Some sites run this preload a second time after load. Without this the
@@ -593,11 +481,7 @@ function createBottomBar() {
   const left = document.createElement('div');
   Object.assign(left.style, { display: 'flex', flexDirection: 'column', gap: '8px' });
 
-  // Empty until a magnet link is clicked, and hidden while it is.
   bottomBar = bar;
-  torrentRows.clear();
-  torrentPanel = document.createElement('div');
-  Object.assign(torrentPanel.style, { display: 'none', flexDirection: 'column', gap: '8px' });
 
   const actions = document.createElement('div');
   Object.assign(actions.style, { display: 'flex', alignItems: 'center', gap: '8px' });
@@ -611,17 +495,11 @@ function createBottomBar() {
 
   // A second pass over the same page rebuilds the bar, so the old listener goes.
   ipcRenderer.removeAllListeners('download-status');
-  ipcRenderer.removeAllListeners('torrent-progress');
   ipcRenderer.removeAllListeners('subtitle-downloaded');
   ipcRenderer.on('download-status', (event, payload) => showStatus(payload.text, payload.failed));
   ipcRenderer.on('subtitle-downloaded', (event, payload) => openSubtitleModal(payload.archive, payload.name));
-  ipcRenderer.on('torrent-progress', (event, list) => renderTorrents(list));
 
-  // A page load rebuilds the bar, so downloads already running are asked for
-  // rather than waiting for the next tick to reappear.
-  ipcRenderer.invoke('get-torrents').then(renderTorrents);
-
-  left.append(actions, torrentPanel);
+  left.append(actions);
 
   const fields = document.createElement('div');
   Object.assign(fields.style, { display: 'flex', flexDirection: 'column', gap: '6px' });
@@ -702,7 +580,8 @@ const GALLERY_STYLE = `
 let progressCards = [];
 
 // Where the gallery is currently pointed, so a folder that appears while it is
-// open — a finished torrent, say — can be drawn without a navigation.
+// open — a download WebTorrent has just finished, say — can be drawn without a
+// navigation.
 let galleryRoot;
 let galleryDir = '';
 
@@ -926,16 +805,16 @@ function startGallery(root) {
   document.head.append(style);
   // Coming back from VLC is the moment a resume point changes.
   ipcRenderer.on('library-progress-changed', refreshProgress);
-  // A torrent finishing adds a folder the listing has never seen, which
-  // needs the whole listing again rather than only its progress bars.
+  // A download landing in the library adds a folder the listing has never
+  // seen, which needs the whole listing again rather than only its bars.
   ipcRenderer.on('library-changed', () => renderGallery(galleryRoot, galleryDir));
   galleryRoot = root;
   renderGallery(root, '');
 }
 
 // --- Missing requirements ------------------------------------------------
-// ffmpeg, ffprobe and VLC are kept in the project's vendor folder rather than
-// installed on the machine. When any of them is absent this page takes over,
+// ffmpeg, ffprobe, VLC and WebTorrent are kept in the project's vendor folder
+// rather than installed on the machine. When any of them is absent this page takes over,
 // downloads what is missing, and hands the window back to the app. Nothing
 // else is rendered, so there is nothing to click while it runs.
 
@@ -981,6 +860,10 @@ const INSTALL_GUIDE = {
   VLC: {
     what: 'plays the videos you click',
     command: 'brew install --cask vlc'
+  },
+  WebTorrent: {
+    what: 'downloads the magnet links you open',
+    command: 'brew install --cask webtorrent'
   }
 };
 
@@ -1071,7 +954,8 @@ function startBlocked(root) {
         ? `downloading \u00b7 ${megabytes(info.received)} of ${megabytes(info.total)}`
         : `downloading \u00b7 ${megabytes(info.received)}`;
       setStatus(info.name, label, { ratio: info.total ? info.received / info.total : null });
-    } else if (info.phase === 'verify') setStatus(info.name, 'checking the download', { ratio: 1 });
+    } else if (info.phase === 'fetch') setStatus(info.name, 'downloading packages');
+    else if (info.phase === 'verify') setStatus(info.name, 'checking the download', { ratio: 1 });
     else if (info.phase === 'install') setStatus(info.name, 'unpacking', { ratio: 1 });
     else if (info.phase === 'done') setStatus(info.name, 'ready', { ratio: 1, state: 'done' });
     else if (info.phase === 'failed') setStatus(info.name, `failed \u00b7 ${info.message}`, { ratio: 0, state: 'failed' });

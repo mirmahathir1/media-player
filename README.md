@@ -1,8 +1,9 @@
 # IMDb
 
-A desktop IMDb browser with a local video library. Videos open in VLC, which
-along with ffmpeg and ffprobe is kept inside the project, so nothing has to be
-installed on the machine separately.
+A desktop IMDb browser with a local video library. Videos open in VLC and
+magnet links open in WebTorrent, which downloads them into the library folder.
+Both apps, along with ffmpeg and ffprobe, are kept inside the project and run
+as outside programs, so nothing has to be installed on the machine separately.
 
 ## Install
 

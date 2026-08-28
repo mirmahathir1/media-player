@@ -1,4 +1,5 @@
-// Keeps ffmpeg, ffprobe and VLC inside the project instead of on the machine.
+// Keeps ffmpeg, ffprobe, VLC and WebTorrent inside the project instead of on
+// the machine.
 //
 // Everything lands under `vendor/`, which main.js searches before the usual
 // system locations. Nothing here needs Electron, so the same module runs from
@@ -25,6 +26,14 @@ const VLC_INDEX = 'https://get.videolan.org/vlc/last/macosx/';
 // tag so the assets never move under us.
 const FFMPEG_RELEASE = 'https://github.com/eugeneware/ffmpeg-static/releases/download/b6.1.1';
 
+// WebTorrent Desktop is fetched exactly like VLC: one disk image holding one
+// app bundle. Its last release is from 2020 and nothing newer is published, so
+// the URL is pinned rather than looked up. That also means the file never
+// changes, which is why its checksum can be written down here — the project
+// publishes none of its own to check against.
+const WEBTORRENT_DMG = 'https://github.com/webtorrent/webtorrent-desktop/releases/download/v0.24.0/WebTorrent-v0.24.0.dmg';
+const WEBTORRENT_SHA256 = '9cf28d0f0ef74d793cca5a0fee0d7195a11c055b4a6c118cea295c308a3bfd9d';
+
 // Only the combinations that release actually carries.
 const FFMPEG_TARGETS = new Set([
   'darwin-arm64', 'darwin-x64',
@@ -46,13 +55,16 @@ function vendorPaths(root) {
     tmpDir: path.join(dir, '.tmp'),
     vlcApp: path.join(dir, 'VLC.app'),
     ffmpeg: path.join(binDir, exeName('ffmpeg')),
-    ffprobe: path.join(binDir, exeName('ffprobe'))
+    ffprobe: path.join(binDir, exeName('ffprobe')),
+    webtorrentApp: path.join(dir, 'WebTorrent.app')
   };
 }
 
-// VLC is only downloadable as a ready-made bundle on macOS; elsewhere it stays
-// the machine's job, and the app falls back to a system install.
+// VLC and WebTorrent are only downloadable as ready-made bundles on macOS;
+// elsewhere they stay the machine's job, and the app falls back to a system
+// install.
 const canFetchVlc = () => process.platform === 'darwin';
+const canFetchWebtorrent = () => process.platform === 'darwin';
 const canFetchFfmpeg = () => FFMPEG_TARGETS.has(`${process.platform}-${process.arch}`);
 
 // What is still missing from `vendor`, in install order.
@@ -63,6 +75,7 @@ function missingVendorTools(root) {
   if (!fs.existsSync(paths.ffmpeg)) missing.push('ffmpeg');
   if (!fs.existsSync(paths.ffprobe)) missing.push('ffprobe');
   if (!fs.existsSync(paths.vlcApp)) missing.push('VLC');
+  if (!fs.existsSync(paths.webtorrentApp)) missing.push('WebTorrent');
 
   return missing;
 }
@@ -181,16 +194,16 @@ async function latestVlcDmg() {
   return best;
 }
 
-// Copies VLC.app out of a mounted dmg. The mount point is our own folder so a
-// disk image already attached by the user is never touched.
-async function copyFromDmg(dmg, destination, tmpDir) {
+// Copies one app bundle out of a mounted dmg. The mount point is our own
+// folder so a disk image already attached by the user is never touched.
+async function copyFromDmg(dmg, bundle, destination, tmpDir) {
   const mount = path.join(tmpDir, `mount-${process.pid}`);
   await fsp.mkdir(mount, { recursive: true });
 
   await execFileAsync('hdiutil', ['attach', dmg, '-nobrowse', '-readonly', '-mountpoint', mount]);
   try {
-    const source = path.join(mount, 'VLC.app');
-    if (!fs.existsSync(source)) throw new Error('the disk image holds no VLC.app');
+    const source = path.join(mount, bundle);
+    if (!fs.existsSync(source)) throw new Error(`the disk image holds no ${bundle}`);
 
     // `ditto` is the one copy that keeps the bundle's symlinks and signature
     // intact, which the app needs to launch without a Gatekeeper complaint.
@@ -227,7 +240,7 @@ async function installVlc(root, onProgress) {
 
     onProgress({ name: 'VLC', phase: 'install' });
     const partial = `${paths.vlcApp}.partial`;
-    await copyFromDmg(dmg, partial, paths.tmpDir);
+    await copyFromDmg(dmg, 'VLC.app', partial, paths.tmpDir);
 
     // Nothing here went through a browser, so there is no quarantine flag to
     // clear in practice; stripping it anyway keeps a copied-in bundle usable.
@@ -235,6 +248,42 @@ async function installVlc(root, onProgress) {
 
     await fsp.rm(paths.vlcApp, { recursive: true, force: true });
     await fsp.rename(partial, paths.vlcApp);
+  } finally {
+    await fsp.rm(dmg, { force: true });
+  }
+}
+
+// --- WebTorrent Desktop --------------------------------------------------
+
+async function installWebtorrent(root, onProgress) {
+  const paths = vendorPaths(root);
+  if (fs.existsSync(paths.webtorrentApp)) return;
+  if (!canFetchWebtorrent()) throw new Error(`no WebTorrent download for ${process.platform}`);
+
+  const dmg = path.join(paths.tmpDir, path.basename(WEBTORRENT_DMG));
+  await fsp.mkdir(paths.tmpDir, { recursive: true });
+
+  try {
+    await download(WEBTORRENT_DMG, dmg, {
+      onProgress: (received, total) => onProgress({ name: 'WebTorrent', phase: 'download', received, total })
+    });
+
+    // The release is frozen, so a download that does not match the checksum
+    // written down above was cut short or tampered with either way.
+    onProgress({ name: 'WebTorrent', phase: 'verify' });
+    const actual = await sha256(dmg);
+    if (actual !== WEBTORRENT_SHA256) throw new Error('checksum mismatch for the WebTorrent disk image');
+
+    onProgress({ name: 'WebTorrent', phase: 'install' });
+    const partial = `${paths.webtorrentApp}.partial`;
+    await copyFromDmg(dmg, 'WebTorrent.app', partial, paths.tmpDir);
+
+    // Nothing here went through a browser, so there is no quarantine flag to
+    // clear in practice; stripping it anyway keeps a copied-in bundle usable.
+    await execFileAsync('xattr', ['-dr', 'com.apple.quarantine', partial]).catch(() => {});
+
+    await fsp.rm(paths.webtorrentApp, { recursive: true, force: true });
+    await fsp.rename(partial, paths.webtorrentApp);
   } finally {
     await fsp.rm(dmg, { force: true });
   }
@@ -252,6 +301,7 @@ async function ensureVendorTools(root, onProgress = () => {}) {
     try {
       onProgress({ name, phase: 'start' });
       if (name === 'VLC') await installVlc(root, onProgress);
+      else if (name === 'WebTorrent') await installWebtorrent(root, onProgress);
       else await installFfmpegTool(name, root, onProgress);
       onProgress({ name, phase: 'done' });
     } catch (error) {
@@ -269,6 +319,7 @@ module.exports = {
   missingVendorTools,
   ensureVendorTools,
   canFetchVlc,
+  canFetchWebtorrent,
   canFetchFfmpeg
 };
 

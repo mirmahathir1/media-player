@@ -11,9 +11,9 @@ const vendor = require('./scripts/vendor');
 
 const execFileAsync = promisify(execFile);
 
-// ffmpeg, ffprobe and VLC are kept inside the project so no install on the
-// machine is needed. In development that folder sits next to this file; a
-// packaged build carries it in its resources instead.
+// ffmpeg, ffprobe, VLC and WebTorrent are kept inside the project so no
+// install on the machine is needed. In development that folder sits next to
+// this file; a packaged build carries it in its resources instead.
 const VENDOR_ROOT = app.isPackaged ? process.resourcesPath : __dirname;
 const VENDOR = vendor.vendorPaths(VENDOR_ROOT);
 
@@ -625,10 +625,15 @@ async function checkDependencies() {
   const vlc = await findVlc();
   vlcPath = vlc;
 
+  // Unlike VLC, which the machine may already have somewhere, WebTorrent is
+  // only ever the vendored copy: this app opens that bundle by path.
+  const webtorrent = fs.existsSync(VENDOR.webtorrentApp);
+
   missingDependencies = [
     ffmpeg ? '' : 'ffmpeg',
     ffprobe ? '' : 'ffprobe',
-    vlc ? '' : 'VLC'
+    vlc ? '' : 'VLC',
+    webtorrent ? '' : 'WebTorrent'
   ].filter(Boolean);
 
   return missingDependencies;
@@ -712,59 +717,50 @@ async function attachSubtitle(archivePath, videoPath) {
 // --- Torrents ------------------------------------------------------------
 // A magnet link is not a page, so Chromium has nowhere to send it and the
 // click goes nowhere. Every route one can arrive by is caught instead and
-// handed to WebTorrent, which downloads into the same library folder the
-// gallery reads from and leaves the swarm the moment the download is complete.
-
-const TORRENT_TICK = 1000;
-
-let torrentClient = null;
-let torrentTimer = null;
-let torrentSeq = 0;
+// handed to WebTorrent Desktop, the copy kept under `vendor`, exactly as a
+// video is handed to the VLC kept beside it. Downloading, and everything
+// shown about it, is then that app's business rather than this one's.
 
 const isMagnet = (value) => typeof value === 'string' && value.startsWith('magnet:');
 
 const sendAll = (channel, payload) => {
-  for (const win of BrowserWindow.getAllWindows()) win.webContents.send(channel, payload);
+  for (const win of BrowserWindow.getAllWindows()) {
+    if (!win.isDestroyed()) win.webContents.send(channel, payload);
+  }
 };
 
 const torrentStatus = (text, failed) => sendAll('download-status', { text, failed });
 
-// WebTorrent ships as ESM while this file is CommonJS, so the client is pulled
-// in on first use: a session that never meets a magnet link never pays for it.
-async function getTorrentClient() {
-  if (!torrentClient) {
-    const { default: WebTorrent } = await import('webtorrent');
-    torrentClient = new WebTorrent();
-    torrentClient.on('error', (error) => torrentStatus(`Torrent error: ${error.message}`, true));
+// WebTorrent keeps its settings in one file under Application Support, named
+// after the app rather than after any one copy of it. The vendored copy reads
+// the same file as one installed on the machine would, so this rewrites the
+// one setting that matters here and leaves every other one alone.
+const WEBTORRENT_CONFIG = path.join(
+  os.homedir(), 'Library', 'Application Support', 'WebTorrent', 'config.json'
+);
+
+const isWebtorrentRunning = () => execFileAsync('pgrep', ['-x', 'WebTorrent']).then(() => true, () => false);
+
+// Points WebTorrent at the library folder, so what it downloads lands where
+// the gallery looks. A running copy holds its settings in memory and writes
+// them out when it quits, which would undo this, so it is left alone then —
+// by that point an earlier launch has already set the folder.
+async function pointWebtorrentAtLibrary() {
+  if (await isWebtorrentRunning()) return;
+
+  let config = {};
+  try {
+    config = JSON.parse(await fsp.readFile(WEBTORRENT_CONFIG, 'utf8'));
+  } catch {
+    // No settings yet: WebTorrent has never run, so this writes the first ones.
   }
-  return torrentClient;
-}
 
-// What the bottom bar draws for one torrent. A magnet only names the swarm, so
-// the real name and size arrive once peers have handed over the metadata.
-const torrentView = (torrent) => ({
-  id: torrent.appId,
-  name: torrent.name || '',
-  progress: torrent.progress || 0,
-  downloaded: torrent.downloaded || 0,
-  length: torrent.length || 0,
-  speed: torrent.downloadSpeed || 0,
-  peers: torrent.numPeers || 0,
-  done: Boolean(torrent.done)
-});
+  const prefs = { ...config.prefs };
+  if (prefs.downloadPath === libraryPath) return;
 
-const listTorrents = () => (torrentClient ? torrentClient.torrents.map(torrentView) : []);
-
-// One ticker for the whole list, running only while something is in it.
-function startTorrentTicker() {
-  if (torrentTimer) return;
-  torrentTimer = setInterval(() => {
-    sendAll('torrent-progress', listTorrents());
-    if (!torrentClient || torrentClient.torrents.length === 0) {
-      clearInterval(torrentTimer);
-      torrentTimer = null;
-    }
-  }, TORRENT_TICK);
+  prefs.downloadPath = libraryPath;
+  await fsp.mkdir(path.dirname(WEBTORRENT_CONFIG), { recursive: true });
+  await fsp.writeFile(WEBTORRENT_CONFIG, JSON.stringify({ ...config, prefs }, null, 2));
 }
 
 async function addMagnet(magnetURI) {
@@ -776,85 +772,55 @@ async function addMagnet(magnetURI) {
     return { ok: false, reason: 'no-library' };
   }
 
-  let client;
+  if (!fs.existsSync(VENDOR.webtorrentApp)) {
+    torrentStatus('WebTorrent is not installed in the app’s vendor folder.', true);
+    return { ok: false, reason: 'webtorrent-missing' };
+  }
+
   try {
-    client = await getTorrentClient();
+    await pointWebtorrentAtLibrary();
+  } catch (error) {
+    // Worth going on for: the download still runs, just into whatever folder
+    // WebTorrent already had, so the gallery is what misses out.
+    torrentStatus(`Could not point WebTorrent at the library folder: ${error.message}`, true);
+  }
+
+  // `open` hands the link to the bundle and returns; the download belongs to
+  // that app from here, and outlives this one.
+  try {
+    await execFileAsync('open', ['-a', VENDOR.webtorrentApp, magnetURI]);
   } catch (error) {
     torrentStatus(`Could not start WebTorrent: ${error.message}`, true);
-    return { ok: false, reason: 'client-failed', message: error.message };
+    return { ok: false, reason: 'webtorrent-failed', message: error.message };
   }
 
-  // Adding the same magnet twice tears the second copy down and reports that
-  // as an error, so a link clicked again is answered rather than added.
-  const running = await client.get(magnetURI).catch(() => null);
-  if (running) {
-    torrentStatus(`Already downloading ${running.name || 'that torrent'}.`);
-    return { ok: true, duplicate: true };
-  }
-
-  // The library folder is the whole point: WebTorrent lays the torrent out
-  // inside it exactly as the gallery expects to find videos.
-  const torrent = client.add(magnetURI, { path: libraryPath });
-  torrent.appId = `t${(torrentSeq += 1)}`;
-
-  torrent.on('error', (error) => torrentStatus(`Torrent failed: ${error.message}`, true));
-  torrent.on('metadata', () => torrentStatus(`Downloading ${torrent.name} to the library folder.`));
-  torrent.on('done', async () => {
-    // Nothing here seeds. Getting the files into the library is the whole job,
-    // so the swarm is left as soon as the last piece lands rather than being
-    // uploaded from in the background for as long as the app happens to be open.
-    const name = torrent.name || 'torrent';
-    await stopTorrent(torrent);
-
-    torrentStatus(`Finished ${name}. Saved to the library folder.`);
-    // The download is a folder the gallery has never listed, so it redraws.
-    sendAll('library-changed');
-    sendAll('torrent-progress', listTorrents());
-  });
-
-  torrentStatus('Looking for peers…');
-  startTorrentTicker();
-  sendAll('torrent-progress', listTorrents());
-  return { ok: true };
-}
-
-// Leaving the swarm: the connections go, everything already written to the
-// library stays. Finishing and pressing Stop both end up here, and a torrent
-// that finishes just as Stop is pressed reaches it twice, so a torrent the
-// client has already let go is not removed a second time.
-async function stopTorrent(torrent) {
-  if (!torrentClient || !torrentClient.torrents.includes(torrent)) return;
-  await new Promise((resolve) => torrentClient.remove(torrent, { destroyStore: false }, resolve));
-
-  // Dropping the last torrent leaves the client itself running a DHT node and
-  // a port open for incoming peers, which is the app still taking part in
-  // BitTorrent with nothing to show for it. With no downloads left there is
-  // nothing for any of that to serve, so the client goes too and the next
-  // magnet link builds a fresh one.
-  if (torrentClient.torrents.length === 0) {
-    const client = torrentClient;
-    torrentClient = null;
-    await new Promise((resolve) => client.destroy(resolve));
-  }
-}
-
-// Stop, for a torrent that has not finished: an abandoned download, with the
-// part of it that did arrive left in the library.
-async function removeTorrent(id) {
-  const torrent = torrentClient && torrentClient.torrents.find((item) => item.appId === id);
-  if (!torrent) return { ok: false, reason: 'not-found' };
-
-  const name = torrent.name || 'torrent';
-  await stopTorrent(torrent);
-
-  torrentStatus(`Stopped ${name}. What it had already downloaded stays in the library.`);
-  sendAll('torrent-progress', listTorrents());
+  torrentStatus('Opened in WebTorrent, which downloads into the library folder.');
   return { ok: true };
 }
 
 ipcMain.handle('add-magnet', (event, magnetURI) => addMagnet(magnetURI));
-ipcMain.handle('remove-torrent', (event, id) => removeTorrent(id));
-ipcMain.handle('get-torrents', () => listTorrents());
+
+// WebTorrent downloads in its own window and tells this app nothing, so a
+// finished download is noticed rather than announced: coming back to this
+// window is the moment to look, and a new folder in the library is the sign.
+let libraryStamp = 0;
+
+async function refreshLibraryIfChanged(win) {
+  if (!libraryPath) return;
+
+  try {
+    const { mtimeMs } = await fsp.stat(libraryPath);
+    if (mtimeMs === libraryStamp) return;
+
+    // The first look only records where the folder stood, so opening the app
+    // does not redraw a gallery that has not changed.
+    const known = libraryStamp !== 0;
+    libraryStamp = mtimeMs;
+    if (known && !win.isDestroyed()) win.webContents.send('library-changed');
+  } catch {
+    // The library folder has been moved or unplugged; the gallery says so.
+  }
+}
 
 function createWindow() {
   const win = new BrowserWindow({
@@ -889,7 +855,10 @@ function createWindow() {
     addMagnet(url);
   });
 
-  win.on('focus', () => win.webContents.send('library-progress-changed'));
+  win.on('focus', () => {
+    win.webContents.send('library-progress-changed');
+    refreshLibraryIfChanged(win);
+  });
 
   // Subtitle sites hand the file over through an ad interstitial, which leaves
   // the window on a blank page once the download takes over. Save the file into
@@ -1284,12 +1253,6 @@ app.whenReady().then(async () => {
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) createWindow();
   });
-});
-
-// Torrents keep seeding in the background, so the swarm is let go on the way out.
-app.on('before-quit', () => {
-  if (torrentClient) torrentClient.destroy();
-  torrentClient = null;
 });
 
 app.on('window-all-closed', () => {

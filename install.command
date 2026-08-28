@@ -103,9 +103,10 @@ fi
 [ -x "$ELECTRON_BIN" ] || fail "Electron is still not installed."
 echo "Electron is ready"
 
-# ffmpeg, ffprobe and VLC live under vendor/ so nothing has to be installed on
-# the machine. npm install normally fetches them; this covers a partial run.
-step "Checking ffmpeg, ffprobe and VLC"
+# ffmpeg, ffprobe, VLC and WebTorrent live under vendor/ so nothing has to be
+# installed on the machine. npm install normally fetches them; this covers a
+# partial run.
+step "Checking ffmpeg, ffprobe, VLC and WebTorrent"
 npm run vendor
 
 step "Putting IMDb.command on the Desktop"
