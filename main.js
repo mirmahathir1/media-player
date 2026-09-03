@@ -1,10 +1,11 @@
 const { app, BrowserWindow, dialog, ipcMain, shell } = require('electron');
-const { execFile } = require('child_process');
+const { execFile, spawn } = require('child_process');
 const crypto = require('crypto');
 const fs = require('fs');
 const fsp = require('fs/promises');
 const os = require('os');
 const path = require('path');
+const { pathToFileURL } = require('url');
 const { promisify } = require('util');
 
 const vendor = require('./scripts/vendor');
@@ -32,6 +33,9 @@ const VIDEO_EXTENSIONS = new Set([
   '.mp4', '.mkv', '.avi', '.mov', '.m4v', '.wmv', '.flv', '.webm',
   '.mpg', '.mpeg', '.ts', '.m2ts', '.ogv', '.3gp', '.divx', '.vob'
 ]);
+
+const NAME_SORT = { numeric: true, sensitivity: 'base' };
+const compareNames = (a, b) => a.localeCompare(b, undefined, NAME_SORT);
 
 // A GUI-launched app does not inherit a shell PATH, so look in the usual
 // Homebrew locations as well. The downloaded copies come first, since those
@@ -403,6 +407,31 @@ async function findFfmpegTools() {
 
 const isVideoFile = (name) => VIDEO_EXTENSIONS.has(path.extname(name).toLowerCase());
 
+function libraryEntry(dir, dirent) {
+  const isDirectory = dirent.isDirectory();
+  const isVideo = !isDirectory && isVideoFile(dirent.name);
+  return {
+    name: dirent.name,
+    path: path.join(dir, dirent.name),
+    isDirectory,
+    isVideo
+  };
+}
+
+function sortLikeGallery(a, b) {
+  if (a.isDirectory !== b.isDirectory) return a.isDirectory ? -1 : 1;
+  return compareNames(a.name, b.name);
+}
+
+async function readLibraryEntries(dir) {
+  const dirents = await fsp.readdir(dir, { withFileTypes: true });
+  return dirents
+    .filter((dirent) => !dirent.name.startsWith('.'))
+    .map((dirent) => libraryEntry(dir, dirent))
+    .filter((entry) => entry.isDirectory || entry.isVideo)
+    .sort(sortLikeGallery);
+}
+
 // Depth-first, name-ordered, so a folder always resolves to the same video.
 async function findFirstVideo(dir, depth = VIDEO_SEARCH_DEPTH) {
   let dirents;
@@ -414,7 +443,7 @@ async function findFirstVideo(dir, depth = VIDEO_SEARCH_DEPTH) {
 
   const visible = dirents
     .filter((dirent) => !dirent.name.startsWith('.'))
-    .sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true, sensitivity: 'base' }));
+    .sort((a, b) => compareNames(a.name, b.name));
 
   const video = visible.find((dirent) => !dirent.isDirectory() && isVideoFile(dirent.name));
   if (video) return path.join(dir, video.name);
@@ -1036,25 +1065,12 @@ ipcMain.handle('read-library-dir', async (event, dirPath) => {
   const target = insideLibrary(dirPath || libraryPath);
   if (!target) return { ok: false, reason: 'outside-library' };
 
-  let dirents;
+  let entries;
   try {
-    dirents = await fsp.readdir(target, { withFileTypes: true });
+    entries = await readLibraryEntries(target);
   } catch (error) {
     return { ok: false, reason: 'unreadable', message: error.message };
   }
-
-  const entries = dirents
-    .filter((dirent) => !dirent.name.startsWith('.'))
-    .map((dirent) => ({
-      name: dirent.name,
-      path: path.join(target, dirent.name),
-      isDirectory: dirent.isDirectory(),
-      isVideo: !dirent.isDirectory() && VIDEO_EXTENSIONS.has(path.extname(dirent.name).toLowerCase())
-    }))
-    .filter((entry) => entry.isDirectory || entry.isVideo)
-    .sort((a, b) => (a.isDirectory === b.isDirectory
-      ? a.name.localeCompare(b.name, undefined, { numeric: true, sensitivity: 'base' })
-      : a.isDirectory ? -1 : 1));
 
   const root = path.resolve(libraryPath);
   return {
@@ -1103,22 +1119,44 @@ ipcMain.handle('get-progress', async (event, entries) => {
 
 // How many videos may follow the clicked one into VLC's playlist.
 const MAX_QUEUE = 100;
+const VLC_SEQUENCE_OPTIONS = ['--no-random', '--no-loop', '--no-repeat', '--playlist-autostart'];
 
 // Everything after the clicked video in its own folder, in the order the
 // gallery shows it. VLC plays the list straight through, so finishing one
 // video rolls on to the next by itself.
-async function queueFrom(videoPath) {
-  let dirents;
+function queueFromVisibleEntries(videoPath, visibleEntries) {
+  if (!Array.isArray(visibleEntries)) return [];
+
+  const folder = path.dirname(videoPath);
+  const siblings = [];
+
+  for (const entry of visibleEntries) {
+    if (!entry || entry.isDirectory) continue;
+
+    const target = insideLibrary(entry.path);
+    if (!target || path.dirname(target) !== folder || !isVideoFile(target)) continue;
+
+    siblings.push(target);
+  }
+
+  const start = siblings.indexOf(videoPath);
+  return start === -1 ? [] : siblings.slice(start, start + MAX_QUEUE);
+}
+
+async function queueFrom(videoPath, visibleEntries) {
+  const visibleQueue = queueFromVisibleEntries(videoPath, visibleEntries);
+  if (visibleQueue.length) return visibleQueue;
+
+  let entries;
   try {
-    dirents = await fsp.readdir(path.dirname(videoPath), { withFileTypes: true });
+    entries = await readLibraryEntries(path.dirname(videoPath));
   } catch {
     return [videoPath];
   }
 
-  const siblings = dirents
-    .filter((dirent) => !dirent.isDirectory() && !dirent.name.startsWith('.') && isVideoFile(dirent.name))
-    .map((dirent) => path.join(path.dirname(videoPath), dirent.name))
-    .sort((a, b) => path.basename(a).localeCompare(path.basename(b), undefined, { numeric: true, sensitivity: 'base' }));
+  const siblings = entries
+    .filter((entry) => entry.isVideo)
+    .map((entry) => entry.path);
 
   const start = siblings.indexOf(videoPath);
   // A file that vanished between listing and click still plays on its own.
@@ -1127,8 +1165,70 @@ async function queueFrom(videoPath) {
   return siblings.slice(start, start + MAX_QUEUE);
 }
 
+async function vlcPlaylistFor(queue) {
+  if (queue.length === 1) return queue[0];
+
+  const playlistDir = path.join(app.getPath('userData'), 'playlists');
+  await fsp.mkdir(playlistDir, { recursive: true });
+
+  const playlist = path.join(playlistDir, 'autoplay.m3u8');
+  const body = ['#EXTM3U', ...queue.map((videoPath) => pathToFileURL(videoPath).href)].join('\n') + '\n';
+  await fsp.writeFile(playlist, body, 'utf8');
+  return playlist;
+}
+
+function vlcExecutable(player) {
+  if (process.platform !== 'darwin') return player || 'vlc';
+  if (!player) return '';
+
+  const executable = player.endsWith('.app')
+    ? path.join(player, 'Contents', 'MacOS', 'VLC')
+    : player;
+
+  return fs.existsSync(executable) ? executable : '';
+}
+
+function launchDetached(command, args) {
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = (result) => {
+      if (settled) return;
+      settled = true;
+      resolve(result);
+    };
+
+    try {
+      const child = spawn(command, args, { detached: true, stdio: 'ignore' });
+      child.once('error', (error) => finish({ ok: false, error }));
+      child.once('spawn', () => {
+        child.unref();
+        finish({ ok: true });
+      });
+    } catch (error) {
+      finish({ ok: false, error });
+    }
+  });
+}
+
+async function launchVlc(player, playlist) {
+  const executable = vlcExecutable(player);
+  if (executable) {
+    return launchDetached(executable, [...VLC_SEQUENCE_OPTIONS, playlist]);
+  }
+
+  if (process.platform === 'darwin') {
+    return new Promise((resolve) => {
+      execFile('open', ['-a', player || 'VLC', playlist, '--args', ...VLC_SEQUENCE_OPTIONS], (error) => {
+        resolve(error ? { ok: false, error } : { ok: true });
+      });
+    });
+  }
+
+  return launchDetached(player || 'vlc', [...VLC_SEQUENCE_OPTIONS, playlist]);
+}
+
 // Hand the file, and the rest of its folder, to the VLC installed here.
-ipcMain.handle('open-in-vlc', async (event, filePath) => {
+ipcMain.handle('open-in-vlc', async (event, filePath, visibleEntries) => {
   if (isBlocked()) return { ok: false, reason: 'blocked' };
 
   const target = insideLibrary(filePath);
@@ -1136,46 +1236,42 @@ ipcMain.handle('open-in-vlc', async (event, filePath) => {
     return { ok: false, reason: 'not-a-library-video' };
   }
 
-  const queue = await queueFrom(target);
+  const queue = await queueFrom(target, visibleEntries);
   rememberQueue(queue);
   setTimeout(() => { pollPlayback().catch(() => {}); }, 4000);
 
   // Launch the copy that was actually found: the downloaded bundle when there
   // is one, and only otherwise whatever the machine happens to have.
   const player = vlcPath || await findVlc();
-  const [command, args] = process.platform === 'darwin'
-    ? ['open', ['-a', player || 'VLC', ...queue]]
-    : [player || 'vlc', queue];
+  let playlist;
+  try {
+    playlist = await vlcPlaylistFor(queue);
+  } catch (error) {
+    return { ok: false, reason: 'playlist-failed', message: error.message };
+  }
 
   // `open` reports a missing app on stderr; elsewhere the binary itself is absent.
   const isMissing = (error) => error.code === 'ENOENT' || /unable to find application/i.test(error.message);
 
-  return new Promise((resolve) => {
-    execFile(command, args, (error) => {
-      if (!error) {
-        resolve({ ok: true });
-        return;
-      }
+  const launched = await launchVlc(player, playlist);
+  if (launched.ok) return { ok: true };
 
-      if (isMissing(error)) {
-        const win = BrowserWindow.fromWebContents(event.sender);
-        const options = {
-          type: 'error',
-          title: 'VLC not found',
-          message: 'VLC is not installed.',
-          detail: 'Install VLC on this machine, then try playing the video again.',
-          buttons: ['OK']
-        };
-        if (win) dialog.showMessageBox(win, options);
-        else dialog.showMessageBox(options);
+  if (isMissing(launched.error)) {
+    const win = BrowserWindow.fromWebContents(event.sender);
+    const options = {
+      type: 'error',
+      title: 'VLC not found',
+      message: 'VLC is not installed.',
+      detail: 'Install VLC on this machine, then try playing the video again.',
+      buttons: ['OK']
+    };
+    if (win) dialog.showMessageBox(win, options);
+    else dialog.showMessageBox(options);
 
-        resolve({ ok: false, reason: 'vlc-missing' });
-        return;
-      }
+    return { ok: false, reason: 'vlc-missing' };
+  }
 
-      resolve({ ok: false, reason: 'vlc-failed', message: error.message });
-    });
-  });
+  return { ok: false, reason: 'vlc-failed', message: launched.error.message };
 });
 
 // Caches keyed by path outlive the file, so drop anything under a deleted

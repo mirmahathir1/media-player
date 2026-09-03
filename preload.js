@@ -767,7 +767,12 @@ async function renderGallery(root, dirPath) {
           return;
         }
 
-        const result = await ipcRenderer.invoke('open-in-vlc', entry.path);
+        const visibleEntries = listing.entries.map((visible) => ({
+          path: visible.path,
+          isDirectory: visible.isDirectory,
+          isVideo: visible.isVideo
+        }));
+        const result = await ipcRenderer.invoke('open-in-vlc', entry.path, visibleEntries);
         if (!result.ok) {
           pathText.className = 'lg-error';
           if (result.reason === 'vlc-missing') {
@@ -775,6 +780,8 @@ async function renderGallery(root, dirPath) {
             pathText.textContent = 'VLC is not installed on this machine.';
           } else if (result.reason === 'vlc-failed') {
             pathText.textContent = `Could not start VLC (${result.message}).`;
+          } else if (result.reason === 'playlist-failed') {
+            pathText.textContent = `Could not build the autoplay playlist (${result.message}).`;
           } else {
             pathText.textContent = `Could not open that file (${result.reason}).`;
           }
