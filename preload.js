@@ -1,5 +1,78 @@
 const { ipcRenderer } = require('electron');
 
+// --- Accent colour -------------------------------------------------------
+// The app used to be IMDb yellow throughout. It now takes a hue at random on
+// every launch, chosen once in the main process so every window and page in the
+// same run agrees on it. Asked for synchronously: the styles below are built as
+// this file loads, before anything is drawn.
+const ACCENT_HUE = ipcRenderer.sendSync('get-accent-hue');
+
+// The yellow this replaced is about hsl(47, 82%, 53%). Every hue borrows that
+// saturation and lightness, so whatever comes up is vivid to the same degree
+// and hue 47 reproduces the old look exactly.
+const ACCENT_SATURATION = 82;
+const ACCENT_LIGHTNESS = 53;
+
+const accentAt = (lightness) => `hsl(${ACCENT_HUE}, ${ACCENT_SATURATION}%, ${lightness}%)`;
+
+// sRGB channels, 0-255, for an HSL triple.
+function hslToRgb(h, s, l) {
+  const chroma = (1 - Math.abs(2 * (l / 100) - 1)) * (s / 100);
+  const second = chroma * (1 - Math.abs(((h / 60) % 2) - 1));
+  const base = l / 100 - chroma / 2;
+
+  const [r, g, b] = h < 60 ? [chroma, second, 0]
+    : h < 120 ? [second, chroma, 0]
+    : h < 180 ? [0, chroma, second]
+    : h < 240 ? [0, second, chroma]
+    : h < 300 ? [second, 0, chroma]
+    : [chroma, 0, second];
+
+  return [r + base, g + base, b + base].map((channel) => Math.round(channel * 255));
+}
+
+// WCAG relative luminance, which is what makes the two ratios below mean
+// anything: a hue's brightness is nothing like its lightness number.
+function luminance([r, g, b]) {
+  const straighten = (value) => {
+    const channel = value / 255;
+    return channel <= 0.03928 ? channel / 12.92 : ((channel + 0.055) / 1.055) ** 2.4;
+  };
+
+  return 0.2126 * straighten(r) + 0.7152 * straighten(g) + 0.0722 * straighten(b);
+}
+
+function contrast(a, b) {
+  const [lighter, darker] = [luminance(a), luminance(b)].sort((x, y) => y - x);
+  return (lighter + 0.05) / (darker + 0.05);
+}
+
+const ACCENT = accentAt(ACCENT_LIGHTNESS);
+
+// Buttons paint the accent behind their label. Black reads on a yellow, white
+// on a navy, so the label takes whichever the drawn hue actually carries
+// rather than the black the yellow could always assume.
+const ACCENT_INK = (() => {
+  const accent = hslToRgb(ACCENT_HUE, ACCENT_SATURATION, ACCENT_LIGHTNESS);
+  return contrast(accent, [0, 0, 0]) >= contrast(accent, [255, 255, 255]) ? '#000' : '#fff';
+})();
+
+// The accent is also printed as text on the near-black chrome, where a dark
+// hue would all but vanish. Lighten it until it clears a comfortable ratio
+// against the palest of those backgrounds; a yellow already clears it and so
+// stays exactly as it was.
+const ACCENT_ON_DARK = (() => {
+  const background = [30, 30, 30]; // #1e1e1e, the lightest surface it sits on.
+
+  for (let lightness = ACCENT_LIGHTNESS; lightness < 92; lightness += 1) {
+    if (contrast(hslToRgb(ACCENT_HUE, ACCENT_SATURATION, lightness), background) >= 5.5) {
+      return accentAt(lightness);
+    }
+  }
+
+  return accentAt(92);
+})();
+
 // Selector for the title component the bottom-bar buttons read.
 const TARGET_SELECTOR = '[data-testid="hero__primary-text"], .hero__primary-text';
 
@@ -19,8 +92,8 @@ const TILE_SIZE = 72;
 const BUTTON_STYLE = {
   padding: '6px 12px',
   font: '600 12px/1.4 Arial, Helvetica, sans-serif',
-  color: '#000',
-  background: '#f5c518',
+  color: ACCENT_INK,
+  background: ACCENT,
   border: 'none',
   borderRadius: '4px',
   cursor: 'pointer'
@@ -72,7 +145,7 @@ function showStatus(text, failed) {
   if (!statusLabel) return;
   clearTimeout(statusTimer);
   statusLabel.textContent = text;
-  statusLabel.style.color = failed ? '#e08080' : '#f5c518';
+  statusLabel.style.color = failed ? '#e08080' : ACCENT_ON_DARK;
   statusLabel.style.display = text ? 'block' : 'none';
   if (text) statusTimer = setTimeout(() => showStatus(''), 8000);
 }
@@ -220,8 +293,8 @@ function createModalButton(text, onClick, primary) {
   Object.assign(button.style, {
     padding: '6px 12px',
     font: '600 12px/1.4 Arial, Helvetica, sans-serif',
-    color: primary ? '#000' : '#ddd',
-    background: primary ? '#f5c518' : 'transparent',
+    color: primary ? ACCENT_INK : '#ddd',
+    background: primary ? ACCENT : 'transparent',
     border: primary ? 'none' : '1px solid #444',
     borderRadius: '4px',
     whiteSpace: 'nowrap',
@@ -267,7 +340,7 @@ function openSubtitleModal(archive, name) {
 
   const heading = document.createElement('div');
   heading.textContent = 'Connect Subtitle';
-  Object.assign(heading.style, { font: '600 15px/1.4 Arial, Helvetica, sans-serif', color: '#f5c518' });
+  Object.assign(heading.style, { font: '600 15px/1.4 Arial, Helvetica, sans-serif', color: ACCENT_ON_DARK });
 
   const sub = document.createElement('div');
   sub.textContent = `Pick the video ${name} belongs to.`;
@@ -556,7 +629,7 @@ const GALLERY_STYLE = `
     font: 400 13px/1.4 Arial, Helvetica, sans-serif; text-align: center; color: #eee;
     background: #1e1e1e; border: 1px solid #2f2f2f; border-radius: 8px; cursor: pointer;
   }
-  .lg-card:hover { background: #262626; border-color: #f5c518; }
+  .lg-card:hover { background: #262626; border-color: ${ACCENT}; }
   .lg-thumb {
     position: relative; flex: 1; min-height: 0; display: flex;
     align-items: center; justify-content: center;
@@ -568,7 +641,7 @@ const GALLERY_STYLE = `
   .lg-badge { position: absolute; top: 6px; left: 6px; font-size: 16px; line-height: 1; text-shadow: 0 1px 3px rgba(0, 0, 0, 0.9); }
   /* Where VLC stopped last time, if it has played this video before. */
   .lg-progress { flex: none; display: none; height: 4px; background: #333; border-radius: 2px; overflow: hidden; }
-  .lg-progress-fill { height: 100%; width: 0; background: #f5c518; }
+  .lg-progress-fill { height: 100%; width: 0; background: ${ACCENT}; }
   /* Long names wrap instead of truncating, so the whole name is readable. */
   .lg-name { flex: none; overflow-wrap: anywhere; word-break: break-word; }
   .lg-note { color: #999; font-size: 12px; }
@@ -818,20 +891,20 @@ function startGallery(root) {
 
 const BLOCKED_STYLE = `
   .bl-wrap { max-width: 640px; padding: 64px 32px; margin: 0 auto; }
-  .bl-title { margin: 0 0 12px; font-size: 20px; color: #f5c518; }
+  .bl-title { margin: 0 0 12px; font-size: 20px; color: ${ACCENT_ON_DARK}; }
   .bl-text { margin: 0 0 24px; color: #ccc; }
   .bl-list { margin: 0 0 24px; padding: 0; list-style: none; color: #eee; }
   .bl-item { margin: 0 0 18px; }
   .bl-what { color: #999; font-size: 13px; }
   .bl-cmd {
     display: block; margin-top: 8px; padding: 8px 10px;
-    font: 400 13px/1.4 Menlo, Consolas, monospace; color: #f5c518;
+    font: 400 13px/1.4 Menlo, Consolas, monospace; color: ${ACCENT_ON_DARK};
     background: #1e1e1e; border: 1px solid #2f2f2f; border-radius: 4px; user-select: all;
   }
   .bl-hint { margin: 0 0 24px; color: #777; font-size: 12px; }
   .bl-button {
     padding: 8px 16px; font: 600 13px/1.4 Arial, Helvetica, sans-serif;
-    color: #000; background: #f5c518; border: none; border-radius: 4px; cursor: pointer;
+    color: ${ACCENT_INK}; background: ${ACCENT}; border: none; border-radius: 4px; cursor: pointer;
   }
   .bl-button[disabled] { opacity: 0.5; cursor: default; }
 `;

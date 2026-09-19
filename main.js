@@ -10,6 +10,12 @@ const { promisify } = require('util');
 
 const execFileAsync = promisify(execFile);
 
+// The app wears one accent colour, picked afresh each time it starts. Only the
+// hue is chosen here: every window asks for this same number, so a run is all
+// one colour no matter how many pages are loaded, and the shades built from it
+// are the renderer's business.
+const ACCENT_HUE = Math.floor(Math.random() * 360);
+
 const HOME_URL = 'https://www.imdb.com';
 const GALLERY_FILE = path.join(__dirname, 'gallery.html');
 const BLOCKED_FILE = path.join(__dirname, 'blocked.html');
@@ -1002,6 +1008,12 @@ ipcMain.on('inspect-go-back', (event) => {
 });
 
 ipcMain.handle('get-base-urls', () => baseUrls);
+
+// Asked for before a page paints anything, so it is answered synchronously
+// rather than leaving the chrome to flash one colour and settle on another.
+ipcMain.on('get-accent-hue', (event) => {
+  event.returnValue = ACCENT_HUE;
+});
 
 // The blocked page's only action: look again, and start the app if the
 // missing tools have since been installed on the machine.
