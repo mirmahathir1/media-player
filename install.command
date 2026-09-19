@@ -103,11 +103,26 @@ fi
 [ -x "$ELECTRON_BIN" ] || fail "Electron is still not installed."
 echo "Electron is ready"
 
-# ffmpeg, ffprobe, VLC and WebTorrent live under vendor/ so nothing has to be
-# installed on the machine. npm install normally fetches them; this covers a
-# partial run.
+# ffmpeg, ffprobe, VLC and WebTorrent are the machine's, not the app's. The app
+# refuses to start without them, so say now what is missing rather than at the
+# first launch. Missing ones do not stop the install.
 step "Checking ffmpeg, ffprobe, VLC and WebTorrent"
-npm run vendor
+MISSING=()
+command -v ffmpeg  >/dev/null || MISSING+=("ffmpeg:brew install ffmpeg")
+command -v ffprobe >/dev/null || MISSING+=("ffprobe:brew install ffmpeg")
+app_installed() { [ -d "/Applications/$1" ] || [ -d "$HOME/Applications/$1" ]; }
+app_installed "VLC.app" || MISSING+=("VLC:brew install --cask vlc")
+app_installed "WebTorrent.app" || MISSING+=("WebTorrent:brew install --cask webtorrent")
+
+if [ "${#MISSING[@]}" -eq 0 ]; then
+  echo "all present"
+else
+  printf '\033[33mNot installed on this machine:\033[0m\n'
+  for ENTRY in "${MISSING[@]}"; do
+    printf '  %-12s %s\n' "${ENTRY%%:*}" "${ENTRY#*:}"
+  done
+  echo "IMDb will not start until these are installed."
+fi
 
 step "Putting IMDb.command on the Desktop"
 cat > "$LAUNCHER" <<LAUNCHER_EOF

@@ -50,10 +50,17 @@ let statusLabel;
 let statusTimer;
 let bottomBar;
 
+// What the bar's one Back tile does. A web page steps back through history;
+// the gallery swaps this for a step up its folders while it is open, so the
+// same button reads the same way wherever it is pressed.
+const historyBack = () => ipcRenderer.send('inspect-go-back');
+let goBack = historyBack;
+
 // Torrent rows by id, so a redraw updates them in place.
 
-// The bar's own address line: the current web page's URL. Compared against the
-// label itself, so a rebuilt bar always gets filled in.
+// The bar's own address line: the web page's URL, or the folder the gallery is
+// showing — one line for both, since only one of them is ever on screen.
+// Compared against the label itself, so a rebuilt bar always gets filled in.
 function showLocation(text) {
   if (!locationLabel || locationLabel.textContent === text) return;
   locationLabel.textContent = text;
@@ -486,7 +493,7 @@ function createBottomBar() {
   const actions = document.createElement('div');
   Object.assign(actions.style, { display: 'flex', alignItems: 'center', gap: '8px' });
   actions.append(
-    createTile('← Back', () => ipcRenderer.send('inspect-go-back')),
+    createTile('← Back', () => goBack()),
     createSearchButton('Download Content', 'inspect-search', true),
     createSearchButton('Download Subtitle', 'subtitle-search', false),
     ...createLibraryTiles(),
@@ -528,13 +535,6 @@ function createBottomBar() {
 
 const GALLERY_STYLE = `
   .lg-wrap { padding: 20px 24px 8px; }
-  .lg-head { display: flex; align-items: center; gap: 12px; margin-bottom: 18px; }
-  .lg-path { color: #999; font-size: 12px; word-break: break-all; }
-  .lg-up {
-    padding: 6px 12px; font: 600 12px/1.4 Arial, Helvetica, sans-serif;
-    color: #000; background: #f5c518; border: none; border-radius: 4px; cursor: pointer;
-  }
-  .lg-up[disabled] { opacity: 0.45; cursor: default; }
   .lg-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 16px; }
   /* The delete button rides over the card, which is itself a button. */
   .lg-cell { position: relative; }
@@ -714,6 +714,8 @@ async function renderGallery(root, dirPath) {
   wrap.className = 'lg-wrap';
 
   if (!listing.ok) {
+    goBack = historyBack;
+
     const error = document.createElement('p');
     error.className = 'lg-error';
     error.textContent = listing.reason === 'no-library'
@@ -724,22 +726,13 @@ async function renderGallery(root, dirPath) {
     return;
   }
 
-  const head = document.createElement('div');
-  head.className = 'lg-head';
+  // The folder is the address here, so it goes on the same line a web page's
+  // URL does rather than being printed a second time above the grid.
+  showLocation(listing.path);
 
-  const up = document.createElement('button');
-  up.type = 'button';
-  up.className = 'lg-up';
-  up.textContent = '↑ Up';
-  up.disabled = !listing.parent;
-  up.addEventListener('click', () => renderGallery(root, listing.parent));
-
-  const pathText = document.createElement('span');
-  pathText.className = 'lg-path';
-  pathText.textContent = listing.path;
-
-  head.append(up, pathText);
-  wrap.append(head);
+  // Back steps up a folder while there is one to step up to, and at the
+  // library root falls through to history, which is the page arrived from.
+  goBack = listing.parent ? () => renderGallery(root, listing.parent) : historyBack;
 
   const note = document.createElement('p');
   note.className = 'lg-note';
@@ -774,16 +767,15 @@ async function renderGallery(root, dirPath) {
         }));
         const result = await ipcRenderer.invoke('open-in-vlc', entry.path, visibleEntries);
         if (!result.ok) {
-          pathText.className = 'lg-error';
           if (result.reason === 'vlc-missing') {
             // Main already showed a dialog; leave the reason on screen too.
-            pathText.textContent = 'VLC is not installed on this machine.';
+            showStatus('VLC is not installed on this machine.', true);
           } else if (result.reason === 'vlc-failed') {
-            pathText.textContent = `Could not start VLC (${result.message}).`;
+            showStatus(`Could not start VLC (${result.message}).`, true);
           } else if (result.reason === 'playlist-failed') {
-            pathText.textContent = `Could not build the autoplay playlist (${result.message}).`;
+            showStatus(`Could not build the autoplay playlist (${result.message}).`, true);
           } else {
-            pathText.textContent = `Could not open that file (${result.reason}).`;
+            showStatus(`Could not open that file (${result.reason}).`, true);
           }
         }
       }, async () => {
@@ -792,8 +784,7 @@ async function renderGallery(root, dirPath) {
           // The listing changed underneath us, so redraw this folder.
           renderGallery(root, listing.path);
         } else if (result.reason !== 'canceled') {
-          pathText.className = 'lg-error';
-          pathText.textContent = `Could not delete ${entry.name} (${result.message || result.reason}).`;
+          showStatus(`Could not delete ${entry.name} (${result.message || result.reason}).`, true);
         }
       }, showFfmpegNote);
 
@@ -820,10 +811,10 @@ function startGallery(root) {
 }
 
 // --- Missing requirements ------------------------------------------------
-// ffmpeg, ffprobe, VLC and WebTorrent are kept in the project's vendor folder
-// rather than installed on the machine. When any of them is absent this page takes over,
-// downloads what is missing, and hands the window back to the app. Nothing
-// else is rendered, so there is nothing to click while it runs.
+// ffmpeg, ffprobe, VLC and WebTorrent are the machine's to install, not this
+// app's. When any of them is absent this page takes over and says which one
+// and how to get it; nothing else is rendered, so there is nothing to click
+// until they are there.
 
 const BLOCKED_STYLE = `
   .bl-wrap { max-width: 640px; padding: 64px 32px; margin: 0 auto; }
@@ -832,14 +823,6 @@ const BLOCKED_STYLE = `
   .bl-list { margin: 0 0 24px; padding: 0; list-style: none; color: #eee; }
   .bl-item { margin: 0 0 18px; }
   .bl-what { color: #999; font-size: 13px; }
-  .bl-status { margin-top: 4px; color: #999; font-size: 13px; }
-  .bl-status.is-done { color: #7ec87e; }
-  .bl-status.is-failed { color: #e07a7a; }
-  .bl-bar {
-    height: 4px; margin-top: 8px; border-radius: 2px;
-    background: #2f2f2f; overflow: hidden;
-  }
-  .bl-fill { height: 100%; width: 0; background: #f5c518; transition: width 120ms linear; }
   .bl-cmd {
     display: block; margin-top: 8px; padding: 8px 10px;
     font: 400 13px/1.4 Menlo, Consolas, monospace; color: #f5c518;
@@ -853,8 +836,7 @@ const BLOCKED_STYLE = `
   .bl-button[disabled] { opacity: 0.5; cursor: default; }
 `;
 
-// What each tool is for, and the one command that installs it by hand should
-// the download keep failing.
+// What each tool is for, and the one command that installs it.
 const INSTALL_GUIDE = {
   ffmpeg: {
     what: 'grabs the scene shown on each tile',
@@ -874,8 +856,6 @@ const INSTALL_GUIDE = {
   }
 };
 
-const megabytes = (bytes) => `${(bytes / 1e6).toFixed(0)} MB`;
-
 function startBlocked(root) {
   const style = document.createElement('style');
   style.textContent = BLOCKED_STYLE;
@@ -886,32 +866,29 @@ function startBlocked(root) {
 
   const title = document.createElement('h1');
   title.className = 'bl-title';
-  title.textContent = 'Setting up';
+  title.textContent = 'Missing programs';
 
   const text = document.createElement('p');
   text.className = 'bl-text';
-  text.textContent = 'These are downloaded into the app\u2019s own vendor folder, not installed '
-    + 'on this machine. It runs once and takes a few minutes.';
+  text.textContent = 'IMDb runs these as outside programs and does not install them. '
+    + 'Install what is listed below, then check again.';
 
   const list = document.createElement('ul');
   list.className = 'bl-list';
 
   const hint = document.createElement('p');
   hint.className = 'bl-hint';
-  hint.hidden = true;
+  hint.textContent = 'The commands need Homebrew (https://brew.sh). '
+    + 'Installing by hand works just as well, as long as the app ends up somewhere the system knows about.';
 
   const retry = document.createElement('button');
   retry.type = 'button';
   retry.className = 'bl-button';
-  retry.textContent = 'Retry';
-  retry.hidden = true;
+  retry.textContent = 'Check again';
 
-  // One row per missing tool, kept by name so progress can find its own line.
-  const rows = new Map();
-
+  // One row per missing tool, redrawn whenever the check is run again.
   const showMissing = (missing) => {
     list.textContent = '';
-    rows.clear();
 
     for (const name of missing) {
       const guide = INSTALL_GUIDE[name];
@@ -927,83 +904,31 @@ function startBlocked(root) {
       what.className = 'bl-what';
       what.textContent = ` \u00b7 ${guide.what}`;
 
-      const status = document.createElement('div');
-      status.className = 'bl-status';
-      status.textContent = 'waiting';
+      const command = document.createElement('code');
+      command.className = 'bl-cmd';
+      command.textContent = guide.command;
 
-      const bar = document.createElement('div');
-      bar.className = 'bl-bar';
-      const fill = document.createElement('div');
-      fill.className = 'bl-fill';
-      bar.append(fill);
-
-      item.append(heading, what, status, bar);
+      item.append(heading, what, command);
       list.append(item);
-      rows.set(name, { status, fill, command: guide.command });
     }
   };
 
-  const setStatus = (name, message, { ratio = null, state = '' } = {}) => {
-    const row = rows.get(name);
-    if (!row) return;
-
-    row.status.textContent = message;
-    row.status.className = `bl-status${state ? ` is-${state}` : ''}`;
-    if (ratio !== null) row.fill.style.width = `${Math.round(ratio * 100)}%`;
-  };
-
-  // Every phase the vendor download reports, turned into one line of text.
-  ipcRenderer.on('dependency-progress', (event, info) => {
-    if (info.phase === 'start') setStatus(info.name, 'starting', { ratio: 0 });
-    else if (info.phase === 'lookup') setStatus(info.name, 'finding the latest build');
-    else if (info.phase === 'download') {
-      const label = info.total
-        ? `downloading \u00b7 ${megabytes(info.received)} of ${megabytes(info.total)}`
-        : `downloading \u00b7 ${megabytes(info.received)}`;
-      setStatus(info.name, label, { ratio: info.total ? info.received / info.total : null });
-    } else if (info.phase === 'fetch') setStatus(info.name, 'downloading packages');
-    else if (info.phase === 'verify') setStatus(info.name, 'checking the download', { ratio: 1 });
-    else if (info.phase === 'install') setStatus(info.name, 'unpacking', { ratio: 1 });
-    else if (info.phase === 'done') setStatus(info.name, 'ready', { ratio: 1, state: 'done' });
-    else if (info.phase === 'failed') setStatus(info.name, `failed \u00b7 ${info.message}`, { ratio: 0, state: 'failed' });
-  });
-
-  // Anything that could not be fetched falls back to the manual route, with
-  // the commands that install it by hand.
-  const showFallback = (failures) => {
-    hint.textContent = 'Some of it could not be downloaded. Check the connection and retry, '
-      + 'or install by hand: '
-      + failures.map((failure) => (INSTALL_GUIDE[failure.name] || {}).command)
-        .filter(Boolean).filter((cmd, i, all) => all.indexOf(cmd) === i).join(' and ')
-      + '.';
-    hint.hidden = false;
-    retry.hidden = false;
-  };
-
-  // The window is handed back to the app by the main process as soon as
-  // nothing is missing, so a clean run ends this page on its own.
-  const install = async () => {
+  // The main process hands the window back to the app as soon as nothing is
+  // missing, so a successful check ends this page on its own.
+  const recheck = async () => {
     retry.disabled = true;
-    hint.hidden = true;
-
-    const result = await ipcRenderer.invoke('install-dependencies');
-    if (!result.missing.length) return;
-
-    showMissing(result.missing);
-    for (const failure of result.failures) {
-      setStatus(failure.name, `failed \u00b7 ${failure.message}`, { state: 'failed' });
+    try {
+      showMissing(await ipcRenderer.invoke('recheck-dependencies'));
+    } finally {
+      retry.disabled = false;
     }
-    showFallback(result.failures.length ? result.failures : result.missing.map((name) => ({ name })));
-    retry.disabled = false;
   };
 
-  retry.addEventListener('click', install);
+  retry.addEventListener('click', recheck);
 
   showMissing((new URLSearchParams(location.search).get('missing') || '').split(',').filter(Boolean));
   wrap.append(title, text, list, hint, retry);
   root.append(wrap);
-
-  install();
 }
 
 function start() {
@@ -1015,7 +940,6 @@ function start() {
 
   createTopBar();
   createBottomBar();
-  showLocation(location.href);
 
   // Caught on the way down, before the page turns the click into a navigation
   // Chromium has nowhere to send. Scripted magnets are stopped in the main
@@ -1028,11 +952,16 @@ function start() {
     ipcRenderer.invoke('add-magnet', link.href);
   }, true);
 
+  // The gallery is served from a file:// page whose URL says nothing useful,
+  // so it fills the address line with the folder it is showing instead.
   const galleryRoot = document.getElementById(GALLERY_ROOT_ID);
   if (galleryRoot) {
     startGallery(galleryRoot);
     return;
   }
+
+  goBack = historyBack;
+  showLocation(location.href);
 
   // IMDb renders client-side, so both the title and the URL can change
   // without a page load.

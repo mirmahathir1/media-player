@@ -8,15 +8,7 @@ const path = require('path');
 const { pathToFileURL } = require('url');
 const { promisify } = require('util');
 
-const vendor = require('./scripts/vendor');
-
 const execFileAsync = promisify(execFile);
-
-// ffmpeg, ffprobe, VLC and WebTorrent are kept inside the project so no
-// install on the machine is needed. In development that folder sits next to
-// this file; a packaged build carries it in its resources instead.
-const VENDOR_ROOT = app.isPackaged ? process.resourcesPath : __dirname;
-const VENDOR = vendor.vendorPaths(VENDOR_ROOT);
 
 const HOME_URL = 'https://www.imdb.com';
 const GALLERY_FILE = path.join(__dirname, 'gallery.html');
@@ -37,9 +29,8 @@ const VIDEO_EXTENSIONS = new Set([
 const NAME_SORT = { numeric: true, sensitivity: 'base' };
 const compareNames = (a, b) => a.localeCompare(b, undefined, NAME_SORT);
 
-// A GUI-launched app does not inherit a shell PATH, so look in the usual
-// Homebrew locations as well. The downloaded copies come first, since those
-// are the only ones this app can vouch for.
+// A GUI-launched app does not inherit a shell PATH, so the usual Homebrew and
+// system locations are searched as well as whatever PATH there is.
 const FFMPEG_CANDIDATES = ['/opt/homebrew/bin', '/usr/local/bin', '/usr/bin'];
 
 // Thumbnails: how deep to hunt for a folder's first video, and how many
@@ -56,11 +47,11 @@ let baseUrls = { ...DEFAULT_BASE_URLS };
 let libraryPath = '';
 let ffmpegTools = null;
 let vlcPath = '';
+let webtorrentPath = '';
 let missingDependencies = [];
-let installing = null;
 
-// Nothing this app does works without its outside tools, so every entry point
-// stays shut until they are all present.
+// Nothing this app does works without its outside tools, and this app installs
+// none of them, so every entry point stays shut until the machine has them all.
 const isBlocked = () => missingDependencies.length > 0;
 
 const normalizeUrl = (value) => {
@@ -388,7 +379,7 @@ function rememberQueue(paths) {
 async function findFfmpegTools() {
   if (ffmpegTools) return ffmpegTools;
 
-  for (const dir of [VENDOR.binDir, '', ...FFMPEG_CANDIDATES]) {
+  for (const dir of ['', ...FFMPEG_CANDIDATES]) {
     const ffmpeg = dir ? path.join(dir, 'ffmpeg') : 'ffmpeg';
     const ffprobe = dir ? path.join(dir, 'ffprobe') : 'ffprobe';
     try {
@@ -625,6 +616,34 @@ async function buildThumbnail(videoPath) {
 
 // --- Requirements --------------------------------------------------------
 
+// Where a macOS app bundle installed on this machine is, or '' when it is not
+// installed. The two usual folders are checked outright; anywhere else Launch
+// Services is asked rather than guessed at. That question can sit waiting on an
+// Apple Events prompt, so it is given a deadline — this runs before the first
+// window and must not hold the app up.
+async function findAppBundle(bundleName, appName) {
+  const bundles = [
+    path.join('/Applications', bundleName),
+    path.join(os.homedir(), 'Applications', bundleName)
+  ];
+
+  const installed = bundles.find((bundle) => fs.existsSync(bundle));
+  if (installed) return installed;
+
+  try {
+    const { stdout } = await execFileAsync(
+      'osascript',
+      ['-e', `POSIX path of (path to application "${appName}")`],
+      { timeout: 5000 }
+    );
+    return stdout.trim();
+  } catch {
+    return '';
+  }
+}
+
+// The VLC installed on this machine. Nothing is downloaded for it: a machine
+// without VLC is one this app cannot play a video on.
 async function findVlc() {
   if (process.platform !== 'darwin') {
     try {
@@ -635,28 +654,34 @@ async function findVlc() {
     }
   }
 
-  const bundles = [VENDOR.vlcApp, '/Applications/VLC.app', path.join(os.homedir(), 'Applications', 'VLC.app')];
-  const installed = bundles.find((bundle) => fs.existsSync(bundle));
-  if (installed) return installed;
-
-  // Installed somewhere else: ask Launch Services rather than guessing.
-  try {
-    const { stdout } = await execFileAsync('osascript', ['-e', 'POSIX path of (path to application "VLC")']);
-    return stdout.trim();
-  } catch {
-    return '';
-  }
+  return findAppBundle('VLC.app', 'VLC');
 }
 
+// WebTorrent Desktop is a GUI app with no command line worth speaking of, so
+// off macOS it is looked for on PATH under the name its packages install.
+async function findWebtorrent() {
+  if (process.platform !== 'darwin') {
+    try {
+      await execFileAsync('which', ['webtorrent-desktop']);
+      return 'webtorrent-desktop';
+    } catch {
+      return '';
+    }
+  }
+
+  return findAppBundle('WebTorrent.app', 'WebTorrent');
+}
+
+// Everything this app leans on belongs to the machine. This only reports what
+// is absent; installing it is the user's to do.
 async function checkDependencies() {
   ffmpegTools = null;
   const { ffmpeg, ffprobe } = await findFfmpegTools();
   const vlc = await findVlc();
-  vlcPath = vlc;
+  const webtorrent = await findWebtorrent();
 
-  // Unlike VLC, which the machine may already have somewhere, WebTorrent is
-  // only ever the vendored copy: this app opens that bundle by path.
-  const webtorrent = fs.existsSync(VENDOR.webtorrentApp);
+  vlcPath = vlc;
+  webtorrentPath = webtorrent;
 
   missingDependencies = [
     ffmpeg ? '' : 'ffmpeg',
@@ -746,9 +771,9 @@ async function attachSubtitle(archivePath, videoPath) {
 // --- Torrents ------------------------------------------------------------
 // A magnet link is not a page, so Chromium has nowhere to send it and the
 // click goes nowhere. Every route one can arrive by is caught instead and
-// handed to WebTorrent Desktop, the copy kept under `vendor`, exactly as a
-// video is handed to the VLC kept beside it. Downloading, and everything
-// shown about it, is then that app's business rather than this one's.
+// handed to the WebTorrent Desktop installed on this machine, exactly as a
+// video is handed to VLC. Downloading, and everything shown about it, is then
+// that app's business rather than this one's.
 
 const isMagnet = (value) => typeof value === 'string' && value.startsWith('magnet:');
 
@@ -760,10 +785,8 @@ const sendAll = (channel, payload) => {
 
 const torrentStatus = (text, failed) => sendAll('download-status', { text, failed });
 
-// WebTorrent keeps its settings in one file under Application Support, named
-// after the app rather than after any one copy of it. The vendored copy reads
-// the same file as one installed on the machine would, so this rewrites the
-// one setting that matters here and leaves every other one alone.
+// WebTorrent keeps its settings in one file under Application Support. This
+// rewrites the one setting that matters here and leaves every other one alone.
 const WEBTORRENT_CONFIG = path.join(
   os.homedir(), 'Library', 'Application Support', 'WebTorrent', 'config.json'
 );
@@ -801,10 +824,12 @@ async function addMagnet(magnetURI) {
     return { ok: false, reason: 'no-library' };
   }
 
-  if (!fs.existsSync(VENDOR.webtorrentApp)) {
-    torrentStatus('WebTorrent is not installed in the app’s vendor folder.', true);
+  const webtorrent = webtorrentPath || await findWebtorrent();
+  if (!webtorrent) {
+    torrentStatus('WebTorrent is not installed on this machine.', true);
     return { ok: false, reason: 'webtorrent-missing' };
   }
+  webtorrentPath = webtorrent;
 
   try {
     await pointWebtorrentAtLibrary();
@@ -814,10 +839,15 @@ async function addMagnet(magnetURI) {
     torrentStatus(`Could not point WebTorrent at the library folder: ${error.message}`, true);
   }
 
-  // `open` hands the link to the bundle and returns; the download belongs to
-  // that app from here, and outlives this one.
+  // `open` hands the link to the app and returns; the download belongs to that
+  // app from here, and outlives this one.
   try {
-    await execFileAsync('open', ['-a', VENDOR.webtorrentApp, magnetURI]);
+    if (process.platform === 'darwin') {
+      await execFileAsync('open', ['-a', webtorrent, magnetURI]);
+    } else {
+      const launched = await launchDetached(webtorrent, [magnetURI]);
+      if (!launched.ok) throw launched.error;
+    }
   } catch (error) {
     torrentStatus(`Could not start WebTorrent: ${error.message}`, true);
     return { ok: false, reason: 'webtorrent-failed', message: error.message };
@@ -974,34 +1004,11 @@ ipcMain.on('inspect-go-back', (event) => {
 ipcMain.handle('get-base-urls', () => baseUrls);
 
 // The blocked page's only action: look again, and start the app if the
-// missing tools have since been installed.
+// missing tools have since been installed on the machine.
 ipcMain.handle('recheck-dependencies', async (event) => {
   const missing = await checkDependencies();
   if (!missing.length) event.sender.loadURL(HOME_URL);
   return missing;
-});
-
-// Fetch whatever is missing into `vendor`. The blocked page asks for this as
-// soon as it opens, and watches 'dependency-progress' while it runs. A second
-// window asking mid-download joins the run already going rather than starting
-// its own.
-ipcMain.handle('install-dependencies', async (event) => {
-  if (!installing) {
-    const report = (info) => {
-      for (const win of BrowserWindow.getAllWindows()) {
-        win.webContents.send('dependency-progress', info);
-      }
-    };
-
-    installing = vendor.ensureVendorTools(VENDOR_ROOT, report)
-      .then(async (result) => ({ ...result, missing: await checkDependencies() }))
-      .catch((error) => ({ installed: [], failures: [{ name: 'setup', message: error.message }], missing: missingDependencies }))
-      .finally(() => { installing = null; });
-  }
-
-  const result = await installing;
-  if (!result.missing.length && !event.sender.isDestroyed()) event.sender.loadURL(HOME_URL);
-  return result;
 });
 
 ipcMain.handle('set-base-url', (event, key, value) => {
@@ -1240,8 +1247,8 @@ ipcMain.handle('open-in-vlc', async (event, filePath, visibleEntries) => {
   rememberQueue(queue);
   setTimeout(() => { pollPlayback().catch(() => {}); }, 4000);
 
-  // Launch the copy that was actually found: the downloaded bundle when there
-  // is one, and only otherwise whatever the machine happens to have.
+  // The VLC found at startup, looked for again in case it has been installed
+  // or moved since.
   const player = vlcPath || await findVlc();
   let playlist;
   try {
