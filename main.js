@@ -20,11 +20,10 @@ const HOME_URL = 'https://www.imdb.com';
 const GALLERY_FILE = path.join(__dirname, 'gallery.html');
 const BLOCKED_FILE = path.join(__dirname, 'blocked.html');
 
-// The bottom-bar buttons append the encoded title to these prefixes, so each
-// one can be pointed at any search engine or subtitle site.
+// The bottom-bar button appends the encoded title to this prefix, so it can be
+// pointed at any search engine.
 const DEFAULT_BASE_URLS = {
-  inspect: 'https://www.google.com/search?q=',
-  subtitle: 'https://www.opensubtitles.org/en/search2?MovieName='
+  inspect: 'https://www.google.com/search?q='
 };
 
 const VIDEO_EXTENSIONS = new Set([
@@ -699,81 +698,6 @@ async function checkDependencies() {
   return missingDependencies;
 }
 
-// Subtitle downloads land in the library root, next to the videos they belong
-// to. A name already taken gets a numeric suffix rather than being overwritten.
-function freeDownloadPath(dir, filename) {
-  const safe = path.basename(filename || 'download').replace(/[/\\]/g, '_') || 'download';
-  const ext = path.extname(safe);
-  const stem = safe.slice(0, safe.length - ext.length) || 'download';
-
-  let candidate = path.join(dir, safe);
-  for (let n = 2; fs.existsSync(candidate); n += 1) candidate = path.join(dir, `${stem} (${n})${ext}`);
-  return candidate;
-}
-
-// A download worth connecting to a video: the subtitle itself, or the zip
-// subtitle sites wrap it in.
-const isSubtitleDownload = (file) => {
-  const ext = path.extname(file).toLowerCase();
-  return ext === '.zip' || SUBTITLE_EXTENSIONS.includes(ext);
-};
-
-// Prefer .srt, and among equals the biggest file — multi-part archives keep
-// their largest track for the feature, with the rest being samples or notes.
-function pickSubtitle(files) {
-  const ranked = files
-    .map((file) => ({ ...file, rank: SUBTITLE_EXTENSIONS.indexOf(path.extname(file.name).toLowerCase()) }))
-    .filter((file) => file.rank >= 0)
-    .sort((a, b) => (a.rank === b.rank ? b.size - a.size : a.rank - b.rank));
-
-  return ranked[0] || null;
-}
-
-// Moves across a device boundary, which a plain rename cannot do: the archive
-// is unpacked in the system temp folder, the library may be another disk.
-async function moveFile(from, to) {
-  try {
-    await fsp.rename(from, to);
-  } catch {
-    await fsp.copyFile(from, to);
-    await fsp.unlink(from);
-  }
-}
-
-// Unpack the archive, keep only its subtitle under the video's own name, and
-// clear away the archive and everything else that came with it.
-async function attachSubtitle(archivePath, videoPath) {
-  const target = `${videoPath.slice(0, videoPath.length - path.extname(videoPath).length)}`;
-
-  if (path.extname(archivePath).toLowerCase() !== '.zip') {
-    const subtitle = `${target}${path.extname(archivePath).toLowerCase()}`;
-    await moveFile(archivePath, subtitle);
-    return subtitle;
-  }
-
-  const workDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'subtitle-'));
-  try {
-    // -j flattens the archive's own folders, so every file lands in one place.
-    await execFileAsync('unzip', ['-o', '-j', '-q', archivePath, '-d', workDir]);
-
-    const names = await fsp.readdir(workDir);
-    const files = await Promise.all(names.map(async (name) => ({
-      name,
-      size: await fsp.stat(path.join(workDir, name)).then((stat) => stat.size, () => 0)
-    })));
-
-    const chosen = pickSubtitle(files);
-    if (!chosen) throw new Error('the archive holds no subtitle file');
-
-    const subtitle = `${target}${path.extname(chosen.name).toLowerCase()}`;
-    await moveFile(path.join(workDir, chosen.name), subtitle);
-    await fsp.rm(archivePath, { force: true });
-    return subtitle;
-  } finally {
-    await fsp.rm(workDir, { recursive: true, force: true });
-  }
-}
-
 // --- Torrents ------------------------------------------------------------
 // A magnet link is not a page, so Chromium has nowhere to send it and the
 // click goes nowhere. Every route one can arrive by is caught instead and
@@ -924,53 +848,7 @@ function createWindow() {
     win.webContents.send('library-progress-changed');
     refreshLibraryIfChanged(win);
   });
-
-  // Subtitle sites hand the file over through an ad interstitial, which leaves
-  // the window on a blank page once the download takes over. Save the file into
-  // the library and step back to the page the download was started from.
-  win.webContents.session.on('will-download', (event, item) => {
-    const status = (text, failed) => win.webContents.send('download-status', { text, failed });
-
-    if (!libraryPath) {
-      item.cancel();
-      status('Pick a library folder before downloading.', true);
-      return;
-    }
-
-    const target = freeDownloadPath(libraryPath, item.getFilename());
-    item.setSavePath(target);
-    status(`Downloading ${path.basename(target)}…`);
-
-    // Clicking the link navigates to the file itself, which commits and then
-    // hands off to the download, leaving an empty page behind. Only that case
-    // needs undoing: a download that left the page alone is not in the chain.
-    const chain = item.getURLChain();
-    const history = win.webContents.navigationHistory;
-    if (chain.includes(win.webContents.getURL()) && history && history.canGoBack()) {
-      setImmediate(() => history.goBack());
-    }
-
-    item.once('done', (doneEvent, state) => {
-      if (state !== 'completed') {
-        status(`Download ${state} (${path.basename(target)}).`, true);
-        return;
-      }
-
-      status(`Saved ${path.basename(target)} to the library folder.`);
-      // Subtitles are only useful once they sit beside their video under its
-      // name, so the window asks which video this one belongs to.
-      if (isSubtitleDownload(target)) {
-        win.webContents.send('subtitle-downloaded', { archive: target, name: path.basename(target) });
-      }
-    });
-  });
-
 }
-
-// English-only filter for OpenSubtitles. The site accepts it either as a query
-// parameter or as a path segment, so it is matched to the base URL's shape —
-// appending the path form to a query-style base makes the site ignore it.
-const subtitleSuffix = (base) => (base.includes('?') ? '&SubLanguageID=eng' : '/sublanguageid-eng');
 
 // Replace the current page with a search built from the title.
 function runSearch(event, key, query) {
@@ -981,12 +859,10 @@ function runSearch(event, key, query) {
   const term = query.replace(/[^a-zA-Z0-9]+/g, ' ').trim().slice(0, 300).trim();
   if (!term) return;
 
-  const suffix = key === 'subtitle' ? subtitleSuffix(baseUrls[key]) : '';
-  event.sender.loadURL(`${baseUrls[key]}${encodeURIComponent(term)}${suffix}`);
+  event.sender.loadURL(`${baseUrls[key]}${encodeURIComponent(term)}`);
 }
 
 ipcMain.on('inspect-search', (event, query) => runSearch(event, 'inspect', query));
-ipcMain.on('subtitle-search', (event, query) => runSearch(event, 'subtitle', query));
 
 // Bottom-bar IMDb button: straight back to the site the app is built around.
 ipcMain.on('open-home', (event) => {
@@ -1060,23 +936,6 @@ ipcMain.handle('open-local-gallery', (event) => {
 });
 
 // Folders and video files inside the library, folders first.
-ipcMain.handle('attach-subtitle', async (event, archivePath, videoPath) => {
-  if (isBlocked()) return { ok: false, reason: 'blocked' };
-  if (!libraryPath) return { ok: false, reason: 'no-library' };
-
-  const archive = insideLibrary(archivePath);
-  const video = insideLibrary(videoPath);
-  if (!archive || !video) return { ok: false, reason: 'outside-library' };
-  if (!isVideoFile(video)) return { ok: false, reason: 'not-a-video' };
-
-  try {
-    const subtitle = await attachSubtitle(archive, video);
-    return { ok: true, subtitle: path.basename(subtitle) };
-  } catch (error) {
-    return { ok: false, reason: 'failed', message: error.message };
-  }
-});
-
 ipcMain.handle('read-library-dir', async (event, dirPath) => {
   if (isBlocked()) return { ok: false, reason: 'blocked' };
   if (!libraryPath) return { ok: false, reason: 'no-library' };

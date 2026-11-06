@@ -85,7 +85,6 @@ const BAR_HEIGHT = 92;
 const TOP_BAR_ID = '__imdb_location_bar__';
 const TOP_BAR_HEIGHT = 34;
 const GALLERY_ROOT_ID = '__local_gallery_root__';
-const SUBTITLE_MODAL_ID = '__connect_subtitle_modal__';
 const BLOCKED_ROOT_ID = '__blocked_root__';
 const TILE_SIZE = 72;
 
@@ -172,11 +171,10 @@ function findYear() {
   return '';
 }
 
-// The query a search is built from. Download Content wants the year to pin
-// down the title; OpenSubtitles matches better on the name alone.
-function titleQuery(withYear) {
+// The query a search is built from, with the year to pin down the title.
+function titleQuery() {
   const title = findTitle();
-  if (!title || !withYear) return title;
+  if (!title) return title;
   const year = findYear();
   return year ? `${title} ${year}` : title;
 }
@@ -202,9 +200,9 @@ function createButton(text, onClick, style = BUTTON_STYLE) {
 
 const createTile = (text, onClick) => createButton(text, onClick, TILE_STYLE);
 
-function createSearchButton(text, channel, withYear) {
+function createSearchButton(text, channel) {
   const button = createTile(text, () => {
-    const query = titleQuery(withYear);
+    const query = titleQuery();
     if (query) ipcRenderer.send(channel, query);
   });
   titleButtons.push(button);
@@ -217,9 +215,7 @@ function createBaseUrlRow(key, labelText, placeholder) {
 
   const label = document.createElement('span');
   label.textContent = labelText;
-  label.title = key === 'subtitle'
-    ? 'The encoded title is appended to this URL'
-    : 'The encoded title and year are appended to this URL';
+  label.title = 'The encoded title and year are appended to this URL';
   Object.assign(label.style, { width: '112px', textAlign: 'right' });
 
   const input = document.createElement('input');
@@ -279,184 +275,6 @@ function createLibraryTiles() {
   const imdb = createTile('IMDb', () => ipcRenderer.send('open-home'));
 
   return [gallery, imdb];
-}
-
-// --- Connect subtitle ----------------------------------------------------
-// A freshly downloaded subtitle is an archive sitting in the library root. The
-// modal browses the library the gallery way, and the video the user picks is
-// the one the subtitle is unpacked next to and named after.
-
-function createModalButton(text, onClick, primary) {
-  const button = document.createElement('button');
-  button.type = 'button';
-  button.textContent = text;
-  Object.assign(button.style, {
-    padding: '6px 12px',
-    font: '600 12px/1.4 Arial, Helvetica, sans-serif',
-    color: primary ? ACCENT_INK : '#ddd',
-    background: primary ? ACCENT : 'transparent',
-    border: primary ? 'none' : '1px solid #444',
-    borderRadius: '4px',
-    whiteSpace: 'nowrap',
-    flex: '0 0 auto',
-    cursor: 'pointer'
-  });
-  button.addEventListener('click', onClick);
-  return button;
-}
-
-function openSubtitleModal(archive, name) {
-  document.getElementById(SUBTITLE_MODAL_ID)?.remove();
-
-  const overlay = document.createElement('div');
-  overlay.id = SUBTITLE_MODAL_ID;
-  Object.assign(overlay.style, {
-    position: 'fixed',
-    inset: '0',
-    zIndex: '2147483646',
-    display: 'flex',
-    alignItems: 'center',
-    justifyContent: 'center',
-    background: 'rgba(0, 0, 0, 0.72)',
-    font: '400 13px/1.5 Arial, Helvetica, sans-serif',
-    color: '#eee'
-  });
-
-  const panel = document.createElement('div');
-  Object.assign(panel.style, {
-    display: 'flex',
-    flexDirection: 'column',
-    width: 'min(560px, 90vw)',
-    maxHeight: '72vh',
-    background: '#1b1b1b',
-    border: '1px solid #333',
-    borderRadius: '8px',
-    boxShadow: '0 18px 48px rgba(0, 0, 0, 0.55)',
-    overflow: 'hidden'
-  });
-
-  const head = document.createElement('div');
-  Object.assign(head.style, { padding: '14px 16px', borderBottom: '1px solid #2f2f2f' });
-
-  const heading = document.createElement('div');
-  heading.textContent = 'Connect Subtitle';
-  Object.assign(heading.style, { font: '600 15px/1.4 Arial, Helvetica, sans-serif', color: ACCENT_ON_DARK });
-
-  const sub = document.createElement('div');
-  sub.textContent = `Pick the video ${name} belongs to.`;
-  Object.assign(sub.style, { marginTop: '4px', color: '#aaa', wordBreak: 'break-all' });
-
-  head.append(heading, sub);
-
-  const nav = document.createElement('div');
-  Object.assign(nav.style, {
-    display: 'flex', alignItems: 'center', gap: '10px',
-    padding: '10px 16px', borderBottom: '1px solid #2f2f2f'
-  });
-
-  const pathText = document.createElement('span');
-  Object.assign(pathText.style, {
-    color: '#999', fontSize: '12px', overflow: 'hidden',
-    textOverflow: 'ellipsis', whiteSpace: 'nowrap'
-  });
-
-  const list = document.createElement('div');
-  Object.assign(list.style, { overflowY: 'auto', padding: '6px 0', flex: '1 1 auto', minHeight: '120px' });
-
-  const foot = document.createElement('div');
-  Object.assign(foot.style, {
-    display: 'flex', alignItems: 'center', gap: '12px',
-    padding: '12px 16px', borderTop: '1px solid #2f2f2f'
-  });
-
-  const note = document.createElement('span');
-  Object.assign(note.style, { color: '#888', fontSize: '12px', flex: '1 1 auto' });
-
-  const close = () => {
-    document.removeEventListener('keydown', onKey, true);
-    overlay.remove();
-  };
-
-  function onKey(event) {
-    if (event.key === 'Escape') {
-      event.stopPropagation();
-      close();
-    }
-  }
-
-  const cancel = createModalButton('Not now', () => {
-    close();
-    showStatus(`${name} is waiting in the library folder.`);
-  });
-
-  let up;
-
-  async function render(dirPath) {
-    const listing = await ipcRenderer.invoke('read-library-dir', dirPath);
-    list.textContent = '';
-
-    if (!listing.ok) {
-      note.textContent = `Could not read the library (${listing.message || listing.reason}).`;
-      note.style.color = '#e08080';
-      return;
-    }
-
-    pathText.textContent = listing.path;
-    up.disabled = !listing.parent;
-    up.style.opacity = listing.parent ? '1' : '0.45';
-    up.style.cursor = listing.parent ? 'pointer' : 'default';
-    up.onclick = () => render(listing.parent);
-
-    if (!listing.entries.length) {
-      const empty = document.createElement('div');
-      empty.textContent = 'No folders or videos here.';
-      Object.assign(empty.style, { padding: '10px 16px', color: '#888' });
-      list.append(empty);
-      return;
-    }
-
-    for (const entry of listing.entries) {
-      const row = document.createElement('div');
-      row.textContent = `${entry.isDirectory ? '📁' : '🎬'}  ${entry.name}`;
-      Object.assign(row.style, {
-        padding: '8px 16px', cursor: 'pointer', color: '#eee',
-        overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap'
-      });
-      row.addEventListener('mouseenter', () => { row.style.background = '#2a2a2a'; });
-      row.addEventListener('mouseleave', () => { row.style.background = 'transparent'; });
-
-      row.addEventListener('click', async () => {
-        if (entry.isDirectory) {
-          render(entry.path);
-          return;
-        }
-
-        note.style.color = '#888';
-        note.textContent = `Connecting to ${entry.name}…`;
-        const result = await ipcRenderer.invoke('attach-subtitle', archive, entry.path);
-
-        if (result.ok) {
-          close();
-          showStatus(`Connected ${result.subtitle} to ${entry.name}.`);
-        } else {
-          note.style.color = '#e08080';
-          note.textContent = `Could not connect it (${result.message || result.reason}).`;
-        }
-      });
-
-      list.append(row);
-    }
-  }
-
-  up = createModalButton('↑ Up', () => {});
-  nav.append(up, pathText);
-  foot.append(note, cancel);
-  panel.append(head, nav, list, foot);
-  overlay.append(panel);
-  document.body.append(overlay);
-  document.addEventListener('keydown', onKey, true);
-
-  render('');
 }
 
 // The address line rides at the top of the page, the way the gallery prints the
@@ -567,17 +385,14 @@ function createBottomBar() {
   Object.assign(actions.style, { display: 'flex', alignItems: 'center', gap: '8px' });
   actions.append(
     createTile('← Back', () => goBack()),
-    createSearchButton('Download Content', 'inspect-search', true),
-    createSearchButton('Download Subtitle', 'subtitle-search', false),
+    createSearchButton('Download Content', 'inspect-search'),
     ...createLibraryTiles(),
     settingsToggle
   );
 
   // A second pass over the same page rebuilds the bar, so the old listener goes.
   ipcRenderer.removeAllListeners('download-status');
-  ipcRenderer.removeAllListeners('subtitle-downloaded');
   ipcRenderer.on('download-status', (event, payload) => showStatus(payload.text, payload.failed));
-  ipcRenderer.on('subtitle-downloaded', (event, payload) => openSubtitleModal(payload.archive, payload.name));
 
   left.append(actions);
 
@@ -585,12 +400,10 @@ function createBottomBar() {
   Object.assign(fields.style, { display: 'flex', flexDirection: 'column', gap: '6px' });
 
   const inspect = createBaseUrlRow('inspect', 'Download Base URL', 'https://www.google.com/search?q=');
-  const subtitle = createBaseUrlRow('subtitle', 'Subtitle Base URL', 'https://www.opensubtitles.org/en/search2?MovieName=');
-  fields.append(inspect.row, subtitle.row);
+  fields.append(inspect.row);
 
   ipcRenderer.invoke('get-base-urls').then((urls) => {
     inspect.input.value = urls.inspect || '';
-    subtitle.input.value = urls.subtitle || '';
   });
 
   settings.append(fields, createPickTile());
