@@ -1184,14 +1184,26 @@ async function queueFrom(videoPath, visibleEntries) {
   return siblings.slice(start, start + MAX_QUEUE);
 }
 
-async function vlcPlaylistFor(queue) {
-  if (queue.length === 1) return queue[0];
+function hasAttachedSubtitle(videoPath) {
+  const { dir, name } = path.parse(videoPath);
+  return SUBTITLE_EXTENSIONS.some((ext) => fs.existsSync(path.join(dir, `${name}${ext}`)));
+}
 
+// Asks VLC for the video's first subtitle track, which it otherwise only turns
+// on when the file flags one as default. Left off for a video with an attached
+// subtitle: VLC shows that by itself, but this would pick an embedded track
+// over it. Set per video, so it has to go through a playlist even for just one.
+function playlistEntry(videoPath) {
+  const entry = pathToFileURL(videoPath).href;
+  return hasAttachedSubtitle(videoPath) ? [entry] : ['#EXTVLCOPT:sub-track=0', entry];
+}
+
+async function vlcPlaylistFor(queue) {
   const playlistDir = path.join(app.getPath('userData'), 'playlists');
   await fsp.mkdir(playlistDir, { recursive: true });
 
   const playlist = path.join(playlistDir, 'autoplay.m3u8');
-  const body = ['#EXTM3U', ...queue.map((videoPath) => pathToFileURL(videoPath).href)].join('\n') + '\n';
+  const body = ['#EXTM3U', ...queue.flatMap(playlistEntry)].join('\n') + '\n';
   await fsp.writeFile(playlist, body, 'utf8');
   return playlist;
 }
