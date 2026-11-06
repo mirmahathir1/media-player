@@ -1,7 +1,8 @@
 # IMDb
 
-A desktop IMDb browser with a local video library. Videos open in VLC and
-magnet links open in WebTorrent, which downloads them into the library folder.
+A desktop IMDb browser with a local video library. Videos open in VLC, closing
+any VLC already running, and magnet links open in WebTorrent, which downloads
+them into the library folder.
 
 ## Requirements
 

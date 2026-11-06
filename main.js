@@ -199,13 +199,7 @@ function remember(target, record) {
 }
 
 async function isVlcRunning() {
-  try {
-    const { stdout } = await execFileAsync('pgrep', ['-x', process.platform === 'darwin' ? 'VLC' : 'vlc']);
-    return stdout.trim().length > 0;
-  } catch {
-    // pgrep exits non-zero when nothing matches.
-    return false;
-  }
+  return (await runningVlcPids()).length > 0;
 }
 
 // Fold what VLC currently remembers into the store, then work out which
@@ -284,16 +278,24 @@ const VLC_PROCESS = process.platform === 'darwin' ? 'VLC' : 'vlc';
 let watchTimer = null;
 // Videos VLC has open right now, and when each was last seen.
 let openVideos = new Map();
+// Set while the app is closing VLC itself, when videos vanishing mean nothing.
+let quittingVlc = false;
+
+// Every running VLC, however it was started.
+async function runningVlcPids() {
+  try {
+    const { stdout } = await execFileAsync('pgrep', ['-x', VLC_PROCESS]);
+    return stdout.trim().split('\n').filter(Boolean);
+  } catch {
+    // pgrep exits non-zero when nothing matches.
+    return [];
+  }
+}
 
 // The video files a running VLC has open, or null when VLC is not running.
 async function openVlcVideos() {
-  let pids;
-  try {
-    const { stdout } = await execFileAsync('pgrep', ['-x', VLC_PROCESS]);
-    pids = stdout.trim().split('\n').filter(Boolean);
-  } catch {
-    return null;
-  }
+  const pids = await runningVlcPids();
+  if (!pids.length) return null;
 
   const open = new Set();
   for (const pid of pids) {
@@ -315,6 +317,7 @@ async function openVlcVideos() {
 
 async function pollPlayback() {
   const open = await openVlcVideos();
+  if (quittingVlc) return;
   const now = Date.now();
 
   if (!open) {
@@ -998,6 +1001,10 @@ ipcMain.handle('get-progress', async (event, entries) => {
 // How many videos may follow the clicked one into VLC's playlist.
 const MAX_QUEUE = 100;
 const VLC_SEQUENCE_OPTIONS = ['--no-random', '--no-loop', '--no-repeat', '--playlist-autostart'];
+const VLC_QUIT_WAIT = 3000;
+const VLC_QUIT_CHECK = 100;
+
+let vlcSwitch = Promise.resolve();
 
 // Everything after the clicked video in its own folder, in the order the
 // gallery shows it. VLC plays the list straight through, so finishing one
@@ -1117,6 +1124,53 @@ async function launchVlc(player, playlist) {
   return launchDetached(player || 'vlc', [...VLC_SEQUENCE_OPTIONS, playlist]);
 }
 
+function signalProcesses(pids, signal) {
+  for (const pid of pids) {
+    try {
+      process.kill(Number(pid), signal);
+    } catch {
+      // Already gone.
+    }
+  }
+}
+
+// Closes every VLC, whether this app or the Dock started it. SIGTERM is an
+// ordinary quit, so VLC still writes its resume points; one that outlasts the
+// wait is killed, so a stuck VLC cannot hold up the next video.
+async function quitRunningVlc() {
+  let pids = await runningVlcPids();
+  if (!pids.length) return;
+
+  quittingVlc = true;
+  signalProcesses(pids, 'SIGTERM');
+
+  const deadline = Date.now() + VLC_QUIT_WAIT;
+  while (pids.length && Date.now() < deadline) {
+    await new Promise((resolve) => { setTimeout(resolve, VLC_QUIT_CHECK); });
+    pids = await runningVlcPids();
+  }
+  signalProcesses(pids, 'SIGKILL');
+
+  // These videos were stopped, not run out: the watcher must not read them as
+  // VLC moving on, nor a video alone in its queue as played to the end.
+  openVideos.clear();
+  queues = queues.filter((queue) => queue.paths.length > 1);
+  quittingVlc = false;
+}
+
+// One click's quit and launch finish before the next click's begin, so a quick
+// second click cannot get past the quit and leave two VLCs open.
+function switchVlcTo(player, playlist, queue) {
+  const switched = vlcSwitch.then(async () => {
+    await quitRunningVlc();
+    rememberQueue(queue);
+    setTimeout(() => { pollPlayback().catch(() => {}); }, 4000);
+    return launchVlc(player, playlist);
+  });
+  vlcSwitch = switched.catch(() => {});
+  return switched;
+}
+
 // Hand the file, and the rest of its folder, to the VLC installed here.
 ipcMain.handle('open-in-vlc', async (event, filePath, visibleEntries) => {
   if (isBlocked()) return { ok: false, reason: 'blocked' };
@@ -1127,8 +1181,6 @@ ipcMain.handle('open-in-vlc', async (event, filePath, visibleEntries) => {
   }
 
   const queue = await queueFrom(target, visibleEntries);
-  rememberQueue(queue);
-  setTimeout(() => { pollPlayback().catch(() => {}); }, 4000);
 
   // The VLC found at startup, looked for again in case it has been installed
   // or moved since.
@@ -1143,7 +1195,7 @@ ipcMain.handle('open-in-vlc', async (event, filePath, visibleEntries) => {
   // `open` reports a missing app on stderr; elsewhere the binary itself is absent.
   const isMissing = (error) => error.code === 'ENOENT' || /unable to find application/i.test(error.message);
 
-  const launched = await launchVlc(player, playlist);
+  const launched = await switchVlcTo(player, playlist, queue);
   if (launched.ok) return { ok: true };
 
   if (isMissing(launched.error)) {
